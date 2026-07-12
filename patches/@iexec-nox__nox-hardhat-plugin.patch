@@ -1,0 +1,39 @@
+diff --git a/dist/src/utils/offchain-services.js b/dist/src/utils/offchain-services.js
+index 730972e8148dfc8fcf83c6d74ce3eeb5e0407ce9..b3482293935030beeafc08f8b32aeb88055b939c 100644
+--- a/dist/src/utils/offchain-services.js
++++ b/dist/src/utils/offchain-services.js
+@@ -20,9 +20,17 @@ export async function startOffchainServices() {
+     console.log("[nox] 🚀 Starting Nox offchain stack...");
+     await runComposeWithCleanErrors("start", () => upAll({
+         ...COMPOSE_OPTS,
++        // `docker-compose` spawns the CLI with `env` REPLACING the parent
++        // environment (not merging). Without PATH/SystemRoot/USERPROFILE/APPDATA
++        // the Docker CLI cannot resolve its context or the named pipe on Windows,
++        // so the stack fails to start. Inherit the parent env explicitly.
++        env: { ...process.env, ...COMPOSE_OPTS.env },
+         commandOptions: ["--wait", "--remove-orphans"],
+     }));
+-    const { data } = await runComposeWithCleanErrors("start", () => port(HANDLE_GATEWAY_SERVICE, HANDLE_GATEWAY_CONTAINER_PORT, COMPOSE_OPTS));
++    const { data } = await runComposeWithCleanErrors("start", () => port(HANDLE_GATEWAY_SERVICE, HANDLE_GATEWAY_CONTAINER_PORT, {
++        ...COMPOSE_OPTS,
++        env: { ...process.env, ...COMPOSE_OPTS.env },
++    }));
+     if (!data.port) {
+         throw new Error(`[nox] Could not determine the host port for ${HANDLE_GATEWAY_SERVICE}.`);
+     }
+@@ -32,6 +40,7 @@ export async function startOffchainServices() {
+ export async function stopOffchainServices() {
+     await runComposeWithCleanErrors("stop", () => downAll({
+         ...COMPOSE_OPTS,
++        env: { ...process.env, ...COMPOSE_OPTS.env },
+         commandOptions: ["--volumes", "--remove-orphans"],
+     }));
+ }
+@@ -44,6 +53,7 @@ export async function stopOffchainServices() {
+ export async function dumpOffchainServicesLogs() {
+     const result = await composeLogs(ALL_SERVICES, {
+         ...COMPOSE_OPTS,
++        env: { ...process.env, ...COMPOSE_OPTS.env },
+         log: false,
+         commandOptions: ["--no-color", "--timestamps"],
+     });
