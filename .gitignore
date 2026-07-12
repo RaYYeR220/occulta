@@ -1,0 +1,44 @@
+# deps / build
+node_modules/
+dist/
+artifacts/
+cache/
+types/
+coverage/
+*.tsbuildinfo
+
+# hardhat / foundry
+ignition/deployments/chain-31337/
+out/
+broadcast/
+.env
+.env.*
+!.env.example
+
+# local nox stack
+offchain-services.log
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+
+# working artifacts — never publish
+_internal/
+BRIEF.md
+ALTERNATIVES.md
+MEMORY.md
+.remember/
+.claude/
+.agents/
+docs/superpowers/
+plans/
+specs/
+ui-prototypes/
+mockups/
+design-ref/
+variants/
+*-internal/
+*-backup*
+*.bundle
+scratch/
