@@ -62,6 +62,9 @@ async function assertRevertsWithError(promise: Promise<unknown>, errorName: stri
   });
 }
 
+type Viem = Awaited<ReturnType<typeof nox.connect>>["viem"];
+type Wallet = Awaited<ReturnType<Viem["getWalletClients"]>>[number];
+
 /** Deploys a fresh MockUSDC + OccultaUSDC + OccultaVault stack. `agent` is set as the vault's
  * Ownable owner — the only account allowed to call `approveDeposit` / `approveRedeem`. */
 async function deployVault(viem: Awaited<ReturnType<typeof nox.connect>>["viem"], agent: { account: { address: `0x${string}` } }) {
@@ -114,6 +117,61 @@ async function prepDeposit(
   });
 
   return balanceHandle;
+}
+
+type Stack = Awaited<ReturnType<typeof deployVault>>;
+
+/** Grants `to` Nox ACL access on `handle`, acting as `from` — who must already be allowed on it. */
+async function grantHandle(from: Wallet, handle: `0x${string}`, to: `0x${string}`) {
+  await from.writeContract({
+    address: NOX_COMPUTE_ADDRESS,
+    abi: noxComputeAbi,
+    functionName: "allow",
+    args: [handle, to],
+  });
+}
+
+/**
+ * Decrypts a handle owned by someone other than account 0. `nox.decrypt` is bound to
+ * `viem.getWalletClients()[0]`, so `holder` first grants that account (`decrypter`, the agent in
+ * the multi-party tests) Nox ACL access on the handle. The value itself is genuinely decrypted.
+ */
+async function decryptAs(holder: Wallet, decrypter: Wallet, handle: `0x${string}`): Promise<bigint> {
+  if (handle === ZERO_HANDLE) return 0n;
+  await grantHandle(holder, handle, decrypter.account.address);
+  return decryptAmount(handle);
+}
+
+/** Full deposit lifecycle for `depositor` on an `agent`-owned vault: request -> approve -> claim. */
+async function depositAndClaim(stack: Stack, agent: Wallet, depositor: Wallet, amount: bigint) {
+  const { underlying, asset, vault } = stack;
+  const balanceHandle = await prepDeposit(asset, vault, underlying, depositor, amount);
+  await vault.write.requestDeposit(
+    [balanceHandle, depositor.account.address, depositor.account.address],
+    { account: depositor.account },
+  );
+  const pendingHandle = (await vault.read.pendingDepositRequest([
+    depositor.account.address,
+  ])) as `0x${string}`;
+  await vault.write.approveDeposit([pendingHandle, depositor.account.address], {
+    account: agent.account,
+  });
+  await vault.write.deposit([depositor.account.address, depositor.account.address], {
+    account: depositor.account,
+  });
+}
+
+/** Escrows `holder`'s entire share balance into a pending redeem request. */
+async function requestFullRedeem(stack: Stack, holder: Wallet) {
+  const { vault } = stack;
+  const sharesHandle = (await vault.read.confidentialBalanceOf([
+    holder.account.address,
+  ])) as `0x${string}`;
+  await grantHandle(holder, sharesHandle, vault.address);
+  await vault.write.requestRedeem(
+    [sharesHandle, holder.account.address, holder.account.address],
+    { account: holder.account },
+  );
 }
 
 /** Runs prep + request + approve + claim for a self-serving depositor who is also the vault's
@@ -420,6 +478,261 @@ describe("OccultaVault", () => {
         finalCusdc,
         AMOUNT,
         "redeeming all shares must return the originally-deposited underlying amount",
+      );
+    },
+  );
+
+  it(
+    "two depositors, one redeem batch: Bob's settlement must not be priced against the assets already reserved for Alice",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      // Account 0 is the AGENT here: `nox.decrypt` binds to `getWalletClients()[0]`, and the
+      // vault grants `owner()` persistent ACL on every pending/claimable bucket and on both
+      // totals — so the agent can genuinely read BOTH depositors' handles.
+      const [agent, alice, bob] = await viem.getWalletClients();
+      const stack = await deployVault(viem, agent);
+      const { asset, vault } = stack;
+
+      await depositAndClaim(stack, agent, alice, AMOUNT);
+      await depositAndClaim(stack, agent, bob, AMOUNT);
+
+      const assetsBefore = await decryptAmount(
+        (await vault.read.confidentialTotalAssets()) as `0x${string}`,
+      );
+      assert.equal(assetsBefore, 2n * AMOUNT, "the vault holds both deposits");
+      const supplyBefore = await decryptAmount(
+        (await vault.read.confidentialTotalSupply()) as `0x${string}`,
+      );
+      assert.equal(
+        supplyBefore,
+        2n * AMOUNT * SEED_SHARE_MULTIPLIER,
+        "both depositors minted at the same price — each owns half the vault",
+      );
+
+      await requestFullRedeem(stack, alice);
+      await requestFullRedeem(stack, bob);
+
+      // The agent settles the batch: Alice, then Bob. Neither has claimed yet — this is the
+      // ordinary operating pattern (settle in a batch, users claim whenever), not a race.
+      const alicePending = (await vault.read.pendingRedeemRequest([
+        alice.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveRedeem([alicePending, alice.account.address], {
+        account: agent.account,
+      });
+      const bobPending = (await vault.read.pendingRedeemRequest([
+        bob.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveRedeem([bobPending, bob.account.address], {
+        account: agent.account,
+      });
+
+      const aliceReserved = await decryptAmount(
+        (await vault.read.claimableRedeemAssets([alice.account.address])) as `0x${string}`,
+      );
+      const bobReserved = await decryptAmount(
+        (await vault.read.claimableRedeemAssets([bob.account.address])) as `0x${string}`,
+      );
+
+      assert.equal(aliceReserved, AMOUNT, "Alice is reserved her half of the vault");
+      assert.equal(
+        bobReserved,
+        AMOUNT,
+        "Bob holds half the shares, so he is owed half the assets: his NAV must exclude the " +
+          "assets already reserved for Alice's approved-but-unclaimed redeem",
+      );
+
+      const vaultAssets = await decryptAmount(
+        (await vault.read.confidentialTotalAssets()) as `0x${string}`,
+      );
+      assert.ok(
+        aliceReserved + bobReserved <= vaultAssets,
+        `vault is insolvent: ${aliceReserved + bobReserved} reserved against a balance of ${vaultAssets}`,
+      );
+
+      // Bob (settled second) claims first. Against an overstated NAV he would drain the vault and
+      // Alice's `_transferOut` would silently clamp to encrypted zero — destroying her claim.
+      await vault.write.redeem([bob.account.address, bob.account.address], {
+        account: bob.account,
+      });
+      await vault.write.redeem([alice.account.address, alice.account.address], {
+        account: alice.account,
+      });
+
+      const bobAssets = await decryptAs(
+        bob,
+        agent,
+        (await asset.read.confidentialBalanceOf([bob.account.address])) as `0x${string}`,
+      );
+      const aliceAssets = await decryptAs(
+        alice,
+        agent,
+        (await asset.read.confidentialBalanceOf([alice.account.address])) as `0x${string}`,
+      );
+      assert.equal(bobAssets, AMOUNT, "Bob is paid out in full");
+      assert.equal(aliceAssets, AMOUNT, "Alice is paid out in full — not a silently-clamped zero");
+    },
+  );
+
+  it(
+    "deposit after an approved-but-unclaimed redeem: the new depositor must not be diluted by the reserved assets",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [agent, alice, bob, carol] = await viem.getWalletClients();
+      const stack = await deployVault(viem, agent);
+      const { underlying, asset, vault } = stack;
+
+      await depositAndClaim(stack, agent, alice, AMOUNT);
+      await depositAndClaim(stack, agent, bob, AMOUNT);
+
+      // Alice's redeem is approved — her shares are burned and AMOUNT of assets is earmarked for
+      // her — but she has not claimed, so those assets still sit in the vault's balance.
+      await requestFullRedeem(stack, alice);
+      const alicePending = (await vault.read.pendingRedeemRequest([
+        alice.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveRedeem([alicePending, alice.account.address], {
+        account: agent.account,
+      });
+
+      const supplyBefore = await decryptAmount(
+        (await vault.read.confidentialTotalSupply()) as `0x${string}`,
+      );
+      assert.equal(
+        supplyBefore,
+        AMOUNT * SEED_SHARE_MULTIPLIER,
+        "only Bob's shares are left outstanding",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.claimableRedeemAssets([alice.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "Alice's assets are reserved but still counted in the vault's balance",
+      );
+
+      // Carol enters. Productive capital = Bob's AMOUNT: Alice's AMOUNT is spoken for and Carol's
+      // own AMOUNT is still pending. She must therefore mint exactly what Bob holds.
+      const carolHandle = await prepDeposit(asset, vault, underlying, carol, AMOUNT);
+      await vault.write.requestDeposit(
+        [carolHandle, carol.account.address, carol.account.address],
+        { account: carol.account },
+      );
+      const carolPending = (await vault.read.pendingDepositRequest([
+        carol.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveDeposit([carolPending, carol.account.address], {
+        account: agent.account,
+      });
+
+      const supplyAfter = await decryptAmount(
+        (await vault.read.confidentialTotalSupply()) as `0x${string}`,
+      );
+      assert.equal(
+        supplyAfter - supplyBefore,
+        AMOUNT * SEED_SHARE_MULTIPLIER,
+        "Carol must mint at par with Bob — pricing her against Alice's reserved assets would " +
+          "double the apparent NAV and halve her entry",
+      );
+
+      await vault.write.deposit([carol.account.address, carol.account.address], {
+        account: carol.account,
+      });
+      const carolShares = await decryptAs(
+        carol,
+        agent,
+        (await vault.read.confidentialBalanceOf([carol.account.address])) as `0x${string}`,
+      );
+      assert.equal(
+        carolShares,
+        AMOUNT * SEED_SHARE_MULTIPLIER,
+        "Carol claims the full, fair share amount",
+      );
+    },
+  );
+
+  it(
+    "claim-path authorization: a third party cannot claim another controller's deposit or redeem bucket",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [agent, alice, mallory] = await viem.getWalletClients();
+      const stack = await deployVault(viem, agent);
+      const { underlying, asset, vault } = stack;
+
+      const balanceHandle = await prepDeposit(asset, vault, underlying, alice, AMOUNT);
+      await vault.write.requestDeposit(
+        [balanceHandle, alice.account.address, alice.account.address],
+        { account: alice.account },
+      );
+      const pendingDeposit = (await vault.read.pendingDepositRequest([
+        alice.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveDeposit([pendingDeposit, alice.account.address], {
+        account: agent.account,
+      });
+
+      // Mallory tries to redirect Alice's escrowed shares to himself.
+      await assertRevertsWithError(
+        vault.write.deposit([mallory.account.address, alice.account.address], {
+          account: mallory.account,
+        }),
+        "ERC7984UnauthorizedSpender",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.claimableDepositRequest([alice.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "Alice's claimable deposit bucket survives the attempt",
+      );
+
+      await vault.write.deposit([alice.account.address, alice.account.address], {
+        account: alice.account,
+      });
+      await requestFullRedeem(stack, alice);
+      const pendingRedeem = (await vault.read.pendingRedeemRequest([
+        alice.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveRedeem([pendingRedeem, alice.account.address], {
+        account: agent.account,
+      });
+
+      // ...and to drain the assets reserved for her redeem.
+      await assertRevertsWithError(
+        vault.write.redeem([mallory.account.address, alice.account.address], {
+          account: mallory.account,
+        }),
+        "ERC7984UnauthorizedSpender",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.claimableRedeemAssets([alice.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "Alice's reserved assets survive the attempt",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await asset.read.confidentialBalanceOf([mallory.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "Mallory received nothing",
+      );
+
+      await vault.write.redeem([alice.account.address, alice.account.address], {
+        account: alice.account,
+      });
+      assert.equal(
+        await decryptAs(
+          alice,
+          agent,
+          (await asset.read.confidentialBalanceOf([alice.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "Alice can still claim her own bucket afterwards",
       );
     },
   );

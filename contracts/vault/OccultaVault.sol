@@ -42,9 +42,12 @@ import {IOccultaVault} from "../interfaces/IOccultaVault.sol";
  *      `(shares, assets)` pair moves into the controller's claimable bucket.
  *   3. {redeem}: a plain `_transferOut` of the reserved assets to `receiver`.
  *
- * Productive NAV = `confidentialTotalAssets() - _totalPendingDepositAssets`. Excluding the
- * pending pool keeps concurrent deposit requests from diluting one another and avoids the
- * `assets / (assets + 1) = 0` degeneracy on the very first deposit.
+ * Productive NAV = `confidentialTotalAssets() - _totalPendingDepositAssets -
+ * _totalClaimableRedeemAssets`: the vault's balance minus every asset in it that backs no
+ * outstanding share. Excluding pending deposits keeps concurrent deposit requests from diluting
+ * one another and avoids the `assets / (assets + 1) = 0` degeneracy on the very first deposit;
+ * excluding approved-but-unclaimed redeems (whose shares are already burned, but whose assets
+ * only leave at claim time) keeps a settlement batch from pricing the same capital twice.
  *
  * Only the vault itself and its `owner()` can decrypt aggregated totals (`confidentialTotalSupply`,
  * `confidentialTotalAssets`) off-chain; individual depositors only ever see their own buckets.
@@ -77,11 +80,18 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
      * @dev Running sum of deposit assets in the Pending state across every controller. Once the
      * agent `approveDeposit`s an amount, the share side is minted against it and this counter is
      * decremented — the corresponding assets become productive from that point.
-     *
-     * Invariant: `confidentialTotalAssets() - _totalPendingDepositAssets` equals the productive
-     * capital (assets with shares already minted against them).
      */
     euint256 private _totalPendingDepositAssets;
+
+    /**
+     * @dev Running sum of assets reserved for approved-but-unclaimed redeems across every
+     * controller (the global mirror of `_claimableRedeemAssets`). `approveRedeem` burns the
+     * escrowed shares immediately, but the matching assets keep sitting in the vault's balance
+     * until the controller calls {redeem}. During that window they are already spoken for: they
+     * back no outstanding shares and must not be priced into anybody else's settlement.
+     * Incremented at `approveRedeem`, decremented by whatever {redeem} actually sends out.
+     */
+    euint256 private _totalClaimableRedeemAssets;
 
     // ============ Errors ============
 
@@ -89,6 +99,8 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
     error OccultaVaultZeroAddress();
     /// @dev Thrown by every sync ERC-4626 entry point: this vault is async-only.
     error OccultaVaultSyncEntryPointDisabled();
+    /// @dev Thrown when a request names the vault itself as the funds owner — see {_requestDeposit}.
+    error OccultaVaultSelfRequest();
 
     // ============ Constructor ============
 
@@ -102,9 +114,10 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         require(address(asset_) != address(0), OccultaVaultInvalidAsset(address(0)));
         _asset = asset_;
 
-        // Seed the inflight counter so the first `requestDeposit` can add to a known handle.
+        // Seed the inflight counters so the first request/settlement can add to a known handle.
         euint256 zero = Nox.toEuint256(0);
         _totalPendingDepositAssets = zero;
+        _totalClaimableRedeemAssets = zero;
         Nox.allowThis(zero);
         Nox.allow(zero, initialOwner_);
     }
@@ -206,9 +219,17 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         // locking funds in an unreachable bucket. A zero `owner_` is rejected downstream by
         // the asset's `confidentialTransferFrom` inside `_transferIn`.
         require(controller != address(0), OccultaVaultZeroAddress());
+        // ERC-7984's `_updateWithOptimizedPrimitives` short-circuits a self-transfer and returns
+        // `amount` unclamped, so a `from == to == address(this)` request would credit a bucket
+        // with an arbitrary amount while moving no tokens. Unreachable today only by accident
+        // (the vault never calls itself), so nail it shut explicitly.
+        require(owner_ != address(this), OccultaVaultSelfRequest());
         require(isOperator(owner_, msg.sender), ERC7984UnauthorizedSpender(owner_, msg.sender));
 
         euint256 transferred = _transferIn(owner_, assets);
+        // The emitted handle is worthless to an off-chain indexer without a persistent grant.
+        Nox.allow(transferred, owner());
+        Nox.allow(transferred, owner_);
 
         euint256 newPending = Nox.add(_pendingDepositAssets[controller], transferred);
         _pendingDepositAssets[controller] = newPending;
@@ -233,12 +254,17 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         address owner_
     ) internal returns (uint256) {
         require(controller != address(0), OccultaVaultZeroAddress());
+        // Same self-transfer footgun as in {_requestDeposit}: escrowing from the vault to the
+        // vault would return `shares` unclamped and inflate the pending bucket for free.
+        require(owner_ != address(this), OccultaVaultSelfRequest());
         require(isOperator(owner_, msg.sender), ERC7984UnauthorizedSpender(owner_, msg.sender));
 
         // Escrow the shares: move them from owner_ to this vault.
         Nox.allowThis(shares);
         euint256 transferred = _transfer(owner_, address(this), shares);
         Nox.allowThis(transferred);
+        Nox.allow(transferred, owner());
+        Nox.allow(transferred, owner_);
 
         euint256 newPending = Nox.add(_pendingRedeemShares[controller], transferred);
         _pendingRedeemShares[controller] = newPending;
@@ -272,13 +298,14 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         (ebool success, euint256 newPending) = Nox.safeSub(_pendingDepositAssets[owner_], assets);
         newPending = Nox.select(success, newPending, _pendingDepositAssets[owner_]);
         euint256 approved = Nox.select(success, assets, Nox.toEuint256(0));
+        Nox.allow(approved, owner());
+        Nox.allow(approved, owner_);
 
         // Snapshot productive NAV BEFORE decrementing _totalPendingDepositAssets: at this point
         // it still contains the full pending of this controller, correctly excluded from the
         // productive denominator.
         (euint256 assetsBefore, euint256 supplyBefore) = _snapshot();
-        euint256 productiveAssets = Nox.sub(assetsBefore, _totalPendingDepositAssets);
-        Nox.allowThis(productiveAssets);
+        euint256 productiveAssets = _productiveAssets(assetsBefore);
         euint256 shares = _convertToShares(approved, productiveAssets, supplyBefore);
 
         // Mint the escrow shares to the vault. They increase totalSupply and sit on
@@ -324,17 +351,25 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         (ebool success, euint256 newPending) = Nox.safeSub(_pendingRedeemShares[owner_], shares);
         newPending = Nox.select(success, newPending, _pendingRedeemShares[owner_]);
         euint256 approved = Nox.select(success, shares, Nox.toEuint256(0));
+        Nox.allow(approved, owner());
+        Nox.allow(approved, owner_);
 
-        // Snapshot productive NAV (excluding pending deposits — see `approveDeposit`; the
-        // redeem side has no pending-assets bucket of its own).
+        // Snapshot productive NAV. `_productiveAssets` excludes the assets already reserved for
+        // earlier approved-but-unclaimed redeems, so settling a batch of redeems back-to-back
+        // prices every leg against the shares that are actually still outstanding.
         (euint256 assetsBefore, euint256 supplyBefore) = _snapshot();
-        euint256 productiveAssets = Nox.sub(assetsBefore, _totalPendingDepositAssets);
-        Nox.allowThis(productiveAssets);
+        euint256 productiveAssets = _productiveAssets(assetsBefore);
         euint256 assetsOut = _convertToAssets(approved, productiveAssets, supplyBefore);
         Nox.allowThis(assetsOut);
 
         // Burn the escrowed shares now.
         _burn(address(this), approved);
+
+        // Earmark the assets: they stay in the vault's balance but stop being productive.
+        euint256 newTotalClaimableRedeem = Nox.add(_totalClaimableRedeemAssets, assetsOut);
+        _totalClaimableRedeemAssets = newTotalClaimableRedeem;
+        Nox.allowThis(newTotalClaimableRedeem);
+        Nox.allow(newTotalClaimableRedeem, owner());
 
         _pendingRedeemShares[owner_] = newPending;
         Nox.allowThis(newPending);
@@ -387,7 +422,13 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
      * @inheritdoc IOccultaVault
      * @dev Claims the reserved assets from the vault to `receiver`. Assets were earmarked and
      * the escrowed shares were burned at `approveRedeem` time; this call is a pure
-     * `_transferOut` with no NAV calculation. Resets both sides of the claimable bucket.
+     * `_transferOut` with no NAV calculation.
+     *
+     * Shortfall-safe: `_transferOut` clamps to the vault's actual balance and returns the amount
+     * genuinely sent, so the asset bucket is set to the RESIDUAL (`assets - sent`) rather than
+     * zeroed. A short balance therefore parks the remainder for a later re-claim instead of
+     * silently destroying it. The share bucket — a settled-amount receipt, never re-spent — is
+     * closed out in full.
      */
     function redeem(address receiver, address controller) external override returns (euint256 assets) {
         require(controller != address(0), OccultaVaultZeroAddress());
@@ -399,11 +440,25 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         assets = _claimableRedeemAssets[controller];
         euint256 zero = Nox.toEuint256(0);
         _claimableRedeemShares[controller] = zero;
-        _claimableRedeemAssets[controller] = zero;
         Nox.allowThis(zero);
 
         Nox.allowThis(assets);
         euint256 sent = _transferOut(receiver, assets);
+        Nox.allowThis(sent);
+        Nox.allow(sent, owner());
+
+        euint256 residual = Nox.sub(assets, sent);
+        _claimableRedeemAssets[controller] = residual;
+        Nox.allowThis(residual);
+        Nox.allow(residual, owner());
+        Nox.allow(residual, controller);
+
+        // Only what actually left the vault stops being reserved; the residual stays earmarked.
+        euint256 newTotalClaimableRedeem = Nox.sub(_totalClaimableRedeemAssets, sent);
+        _totalClaimableRedeemAssets = newTotalClaimableRedeem;
+        Nox.allowThis(newTotalClaimableRedeem);
+        Nox.allow(newTotalClaimableRedeem, owner());
+
         emit RedeemClaimed(controller, receiver, sent);
     }
 
@@ -440,6 +495,16 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
     }
 
     /**
+     * @notice Encrypted amount of the underlying asset reserved for `controller` at
+     * {approveRedeem} time and still sitting in the vault's balance, awaiting a {redeem} claim.
+     * @dev The asset-denominated twin of {claimableRedeemRequest} (which reports the shares that
+     * were burned to produce it). ACL: the vault, the agent (`owner()`) and `controller`.
+     */
+    function claimableRedeemAssets(address controller) external view returns (euint256) {
+        return _claimableRedeemAssets[controller];
+    }
+
+    /**
      * @notice Encrypted running sum of deposit assets pulled into the vault but not yet
      * converted to shares (pending + claimable across every controller).
      * @dev ACL: only the vault itself and the agent (`owner()`) can decrypt this handle.
@@ -447,6 +512,16 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
      */
     function totalPendingDepositAssets() external view returns (euint256) {
         return _totalPendingDepositAssets;
+    }
+
+    /**
+     * @notice Encrypted running sum of assets reserved for approved-but-unclaimed redeems across
+     * every controller. Still part of {confidentialTotalAssets}, but already owed out — excluded
+     * from the productive NAV both settlement paths price against.
+     * @dev ACL: only the vault itself and the agent (`owner()`) can decrypt this handle.
+     */
+    function totalClaimableRedeemAssets() external view returns (euint256) {
+        return _totalClaimableRedeemAssets;
     }
 
     /// @inheritdoc IOccultaVault
@@ -535,6 +610,30 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
     function _snapshot() internal view returns (euint256 assetsBefore, euint256 supplyBefore) {
         assetsBefore = confidentialTotalAssets();
         supplyBefore = confidentialTotalSupply();
+    }
+
+    /**
+     * @dev The vault's balance minus everything in it that is not backing an outstanding share:
+     *
+     *   productive = totalAssets - _totalPendingDepositAssets - _totalClaimableRedeemAssets
+     *
+     * - Pending deposits sit in the balance but no shares have been minted against them yet.
+     * - Approved-but-unclaimed redeems sit in the balance but their shares are already burned.
+     *
+     * `_claimableDepositAssets` is deliberately NOT subtracted: `approveDeposit` already minted
+     * shares against those assets, so they are productive from that moment and must keep backing
+     * the shares they created.
+     *
+     * This is the only denominator either settlement path may price against — using the raw
+     * `totalAssets` would count the same capital twice, over-paying whoever redeems next and
+     * under-issuing shares to whoever deposits next.
+     */
+    function _productiveAssets(euint256 totalAssetsBefore) internal returns (euint256 productive) {
+        productive = Nox.sub(
+            Nox.sub(totalAssetsBefore, _totalPendingDepositAssets),
+            _totalClaimableRedeemAssets
+        );
+        Nox.allowThis(productive);
     }
 
     /**
