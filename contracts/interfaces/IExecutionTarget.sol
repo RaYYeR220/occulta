@@ -19,9 +19,17 @@ interface IExecutionTarget {
      * @notice Executes an epoch's aggregate net order against the public protocols.
      * @dev MUST only be callable by the settler that owns the epoch. Every argument is public by
      * construction: the swap that lands on Uniswap/Aave discloses the same size and direction.
+     *
+     * `netAmount` is guaranteed non-zero. An epoch whose buys and sells cross exactly nets to
+     * zero, and {NetSettler-settle} does not forward it — there is no order to place. Note that
+     * `netIsBuy` is MEANINGLESS when the net is zero (the direction is computed as
+     * `buyTotal >= sellTotal`, which is `true` on equality), which is a second reason such an
+     * epoch is never forwarded. Implementations should nonetheless `require(netAmount > 0)`
+     * defensively rather than rely on the caller's guarantee.
      * @param agentId The strategy agent whose epoch is being executed.
      * @param epoch The epoch whose net is being executed.
-     * @param netAmount The proof-verified aggregate net magnitude. Never an individual intent.
+     * @param netAmount The proof-verified aggregate net magnitude. Never an individual intent,
+     * and never zero.
      * @param netIsBuy Direction of the aggregate order: `true` = buy, `false` = sell.
      * @param minOut Slippage bound for the resulting swap, supplied by the agent runtime.
      */

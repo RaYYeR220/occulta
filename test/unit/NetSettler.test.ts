@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { nox, NOX_COMPUTE_ADDRESS } from "@iexec-nox/nox-hardhat-plugin";
-import { parseAbi } from "viem";
+import { parseAbi, parseEventLogs } from "viem";
 
 /** Amounts are denominated in the 6-decimal USDC scale the rest of the stack uses. */
 const USDC = 1_000_000n;
@@ -9,9 +9,17 @@ const USDC = 1_000_000n;
 const CONTRACT_URI = "https://occulta.example/ocusdc.json";
 const ZERO_HANDLE = `0x${"00".repeat(32)}` as const;
 
-/** Minimal ABI slice of the deployed NoxCompute proxy, used to hand a settler-bound handle
- *  the Nox ACL grant it needs before the settler can fold it into an epoch. */
-const noxComputeAbi = parseAbi(["function allow(bytes32 handle, address account) external"]);
+/**
+ * Minimal ABI slice of the deployed NoxCompute proxy. `allow` hands a settler-bound handle the
+ * Nox ACL grant it needs before the settler can fold it into an epoch. `Select` is read back out
+ * of a submission's receipt to get at the per-intent contribution handles the settler never
+ * exposes itself — an observer's most natural next move once the side is sealed, and one the
+ * privacy tests below have to close.
+ */
+const noxComputeAbi = parseAbi([
+  "function allow(bytes32 handle, address account) external",
+  "event Select(address indexed caller, bytes32 condition, bytes32 ifTrue, bytes32 ifFalse, bytes32 result)",
+]);
 
 /** Flattens an error and its `cause` chain into one searchable string. */
 function flattenError(error: unknown): string {
@@ -41,6 +49,22 @@ async function assertRevertsWithError(promise: Promise<unknown>, errorName: stri
     assert.ok(
       message.includes(errorName),
       `expected revert mentioning "${errorName}", got: ${message}`,
+    );
+    return true;
+  });
+}
+
+/**
+ * Asserts the decryption gateway REFUSES to open `handle` for the public — not that the value is
+ * merely unadvertised. This is the assertion the whole design rests on, so it is made explicitly
+ * (`false` / a refusal), never assumed.
+ */
+async function assertNotPubliclyDecryptable(handle: `0x${string}`, what: string) {
+  await assert.rejects(nox.publicDecrypt(handle), (error: unknown) => {
+    const message = flattenError(error);
+    assert.ok(
+      message.includes("not publicly decryptable"),
+      `expected a public-decryption refusal for ${what}, got: ${message}`,
     );
     return true;
   });
@@ -132,11 +156,21 @@ async function registerAgent(registry: Registry, runtime: Wallet): Promise<bigin
   return agentId;
 }
 
+/** The two sealed halves of one intent, plus the transaction that filed it. */
+interface Intent {
+  /** Handle of the encrypted size. */
+  amount: `0x${string}`;
+  /** Handle of the encrypted SIDE. Never a plaintext bool, anywhere. */
+  side: `0x${string}`;
+  hash: `0x${string}`;
+}
+
 /**
- * Submits one depositor's encrypted intent through the runtime and returns the handle the
- * settler now holds for it. `Nox.fromExternal` wraps the very same bytes32, so the handle
- * returned here is exactly the one accumulated on-chain — which is what makes the privacy
- * assertions below meaningful.
+ * Submits one depositor's encrypted intent through the runtime and returns the handles the
+ * settler now holds for it. BOTH halves of an intent are sealed: `Nox.fromExternal` wraps the
+ * very same bytes32 the gateway minted here, for the size and for the side alike, so the handles
+ * returned are exactly the ones accumulated on-chain — which is what makes the privacy assertions
+ * below meaningful rather than decorative.
  */
 async function submitIntent(
   settler: Settler,
@@ -144,12 +178,14 @@ async function submitIntent(
   agentId: bigint,
   amount: bigint,
   isBuy: boolean,
-): Promise<`0x${string}`> {
-  const { handle, handleProof } = await nox.encryptInput(amount, "uint256", settler.address);
-  await settler.write.submitIntent([agentId, handle, handleProof, isBuy], {
-    account: runtime.account,
-  });
-  return handle;
+): Promise<Intent> {
+  const size = await nox.encryptInput(amount, "uint256", settler.address);
+  const side = await nox.encryptInput(isBuy, "bool", settler.address);
+  const hash = await settler.write.submitIntent(
+    [agentId, size.handle, size.handleProof, side.handle, side.handleProof],
+    { account: runtime.account },
+  );
+  return { amount: size.handle, side: side.handle, hash };
 }
 
 /** Closes the epoch and returns the (magnitude, direction) handle pair it revealed. */
@@ -185,6 +221,8 @@ describe("NetSettler", () => {
       assert.equal(await settler.read.currentEpoch([agentId]), 0n);
 
       // Three different depositors, mixed directions: +100, +250, -50 => net +300 (buy).
+      // Every one of them is folded into BOTH totals under its encrypted side, so the sum below
+      // is the same sum the plaintext-side version produced.
       const alice = await submitIntent(settler, runtime, agentId, 100n * USDC, true);
       const bob = await submitIntent(settler, runtime, agentId, 250n * USDC, true);
       const carol = await submitIntent(settler, runtime, agentId, 50n * USDC, false);
@@ -204,16 +242,21 @@ describe("NetSettler", () => {
       assert.equal(netPlaintext, 300n * USDC, "the revealed net is 100 + 250 - 50 = 300");
       assert.equal(netIsBuy, true, "buys dominate, so the aggregate order is a buy");
 
-      // Nothing but the aggregate ever became public.
-      for (const [who, handle] of [
+      // Nothing but the aggregate ever became public — not a size, not a side.
+      for (const [who, intent] of [
         ["alice", alice],
         ["bob", bob],
         ["carol", carol],
       ] as const) {
         assert.equal(
-          await settler.read.isPubliclyDecryptable([handle]),
+          await settler.read.isPubliclyDecryptable([intent.amount]),
           false,
-          `${who}'s individual intent must never be publicly decryptable`,
+          `${who}'s individual intent size must never be publicly decryptable`,
+        );
+        assert.equal(
+          await settler.read.isPubliclyDecryptable([intent.side]),
+          false,
+          `${who}'s individual intent side must never be publicly decryptable`,
         );
       }
       assert.equal(await settler.read.isPubliclyDecryptable([net]), true);
@@ -275,42 +318,32 @@ describe("NetSettler", () => {
 
       const { net, direction } = await closeEpoch(settler, runtime, agentId, 0n);
 
-      for (const [who, handle] of Object.entries(intents)) {
+      for (const [who, intent] of Object.entries(intents)) {
         // (a) The contract never marked it publicly decryptable...
         assert.equal(
-          await settler.read.isPubliclyDecryptable([handle as `0x${string}`]),
+          await settler.read.isPubliclyDecryptable([intent.amount]),
           false,
           `${who}'s intent must not be publicly decryptable`,
         );
         // (b) ...an outsider holds no ACL grant on it...
         assert.equal(
-          await settler.read.isAllowedFor([handle as `0x${string}`, outsider.account.address]),
+          await settler.read.isAllowedFor([intent.amount, outsider.account.address]),
           false,
           `an outsider must not be allowed on ${who}'s intent`,
         );
         // (c) ...and the settler itself plus the runtime are the ONLY parties that are.
         assert.equal(
-          await settler.read.isAllowedFor([handle as `0x${string}`, settler.address]),
+          await settler.read.isAllowedFor([intent.amount, settler.address]),
           true,
           `the settler must keep ACL on ${who}'s intent to accumulate it`,
         );
         assert.equal(
-          await settler.read.isAllowedFor([handle as `0x${string}`, runtime.account.address]),
+          await settler.read.isAllowedFor([intent.amount, runtime.account.address]),
           true,
           `the runtime must keep ACL on ${who}'s intent`,
         );
         // (d) A public decryption attempt genuinely fails, it is not merely unadvertised.
-        await assert.rejects(
-          nox.publicDecrypt(handle as `0x${string}`),
-          (error: unknown) => {
-            const message = flattenError(error);
-            assert.ok(
-              message.includes("not publicly decryptable"),
-              `expected a public-decryption refusal for ${who}, got: ${message}`,
-            );
-            return true;
-          },
-        );
+        await assertNotPubliclyDecryptable(intent.amount, `${who}'s intent`);
       }
 
       // The running sub-totals are components of the aggregate, not the aggregate: they stay
@@ -336,6 +369,169 @@ describe("NetSettler", () => {
       const { netPlaintext, netIsBuy } = await revealNet(net, direction);
       assert.equal(netPlaintext, 300n * USDC);
       assert.equal(netIsBuy, true);
+    },
+  );
+
+  it(
+    "privacy: an individual intent's SIDE is sealed — not publicly decryptable, not readable by an outsider",
+    { timeout: 300_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const publicClient = await viem.getPublicClient();
+      const [runtime, outsider] = await viem.getWalletClients();
+      const { settler, agentId } = await deployStack(viem, runtime);
+
+      // Two buys and a sell. If the side leaked, THIS is what it would betray: that carol sold
+      // while alice and bob bought — and an intent handle can be a pre-existing on-chain
+      // ciphertext (a depositor's `confidentialBalanceOf`), so a leaked side is not abstract,
+      // it is attributable to a named address.
+      const alice = await submitIntent(settler, runtime, agentId, 100n * USDC, true);
+      const bob = await submitIntent(settler, runtime, agentId, 250n * USDC, true);
+      const carol = await submitIntent(settler, runtime, agentId, 50n * USDC, false);
+      const intents = { alice, bob, carol };
+
+      // The side never appears as a plaintext anywhere in the transaction: the event carries a
+      // 32-byte handle, exactly like the size does.
+      const submitReceipt = await publicClient.waitForTransactionReceipt({ hash: carol.hash });
+      const events = await settler.getEvents.IntentSubmitted(
+        {},
+        { fromBlock: submitReceipt.blockNumber, toBlock: submitReceipt.blockNumber },
+      );
+      assert.equal(events.length, 1);
+      assert.equal(events[0].args.isBuy, carol.side, "the event emits the side HANDLE, not a bool");
+      assert.equal(events[0].args.amount, carol.amount);
+      assert.notEqual(
+        typeof events[0].args.isBuy,
+        "boolean",
+        "no plaintext side may survive anywhere in the event",
+      );
+
+      for (const [who, intent] of Object.entries(intents)) {
+        // (a) The side was never marked publicly decryptable...
+        assert.equal(
+          await settler.read.isPubliclyDecryptable([intent.side]),
+          false,
+          `${who}'s intent side must not be publicly decryptable`,
+        );
+        // (b) ...the gateway genuinely refuses to open it for the public...
+        await assertNotPubliclyDecryptable(intent.side, `${who}'s intent side`);
+        // (c) ...an outsider holds no ACL grant on it, so they cannot decrypt it either...
+        assert.equal(
+          await settler.read.isAllowedFor([intent.side, outsider.account.address]),
+          false,
+          `an outsider must not be allowed on ${who}'s intent side`,
+        );
+        // (d) ...and the settler plus the runtime are the only parties that are.
+        assert.equal(
+          await settler.read.isAllowedFor([intent.side, settler.address]),
+          true,
+          `the settler must keep ACL on ${who}'s side to fold it into both totals`,
+        );
+        assert.equal(
+          await settler.read.isAllowedFor([intent.side, runtime.account.address]),
+          true,
+          `the runtime must keep ACL on ${who}'s side`,
+        );
+      }
+
+      // Two identical sides do not share a handle: the side ciphertext is not a deterministic
+      // function of the bit, so an outsider cannot encrypt `true` themselves and match handles.
+      assert.notEqual(alice.side, bob.side, "two buys must not collide on one side handle");
+
+      // The obvious next move for an observer: the settler never exposes the per-intent
+      // contributions, but NoxCompute's `Select` events do. Those handles are sealed as well —
+      // `select(isBuy, amount, 0)` is worth exactly as much as `isBuy` if you can open it.
+      const contributions = parseEventLogs({
+        abi: noxComputeAbi,
+        eventName: "Select",
+        logs: submitReceipt.logs,
+      }).map((log) => log.args.result as `0x${string}`);
+      assert.equal(contributions.length, 2, "each intent folds into BOTH totals, buy and sell");
+      for (const [i, contribution] of contributions.entries()) {
+        assert.equal(
+          await settler.read.isPubliclyDecryptable([contribution]),
+          false,
+          `contribution ${i} must not be publicly decryptable`,
+        );
+        assert.equal(
+          await settler.read.isAllowedFor([contribution, outsider.account.address]),
+          false,
+          `an outsider must not be allowed on contribution ${i}`,
+        );
+        await assertNotPubliclyDecryptable(contribution, `contribution ${i}`);
+      }
+
+      // And the netting still works, with the sides sealed: 100 + 250 - 50 = 300, a buy.
+      const { net, direction } = await closeEpoch(settler, runtime, agentId, 0n);
+      const { netPlaintext, netIsBuy } = await revealNet(net, direction);
+      assert.equal(netPlaintext, 300n * USDC);
+      assert.equal(netIsBuy, true);
+    },
+  );
+
+  it(
+    "privacy: a buy and a sell are indistinguishable on-chain — same calldata shape, same ops, same events",
+    { timeout: 300_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const publicClient = await viem.getPublicClient();
+      const [runtime] = await viem.getWalletClients();
+      const { registry, settler, agentId: buyAgent } = await deployStack(viem, runtime);
+      const sellAgent = await registerAgent(registry, runtime);
+
+      // Same size, opposite sides, same position (first intent) in a fresh epoch of a fresh
+      // agent: the ONLY difference between these two transactions is a bit inside a ciphertext.
+      const buy = await submitIntent(settler, runtime, buyAgent, 100n * USDC, true);
+      const sell = await submitIntent(settler, runtime, sellAgent, 100n * USDC, false);
+
+      const buyTx = await publicClient.getTransaction({ hash: buy.hash });
+      const sellTx = await publicClient.getTransaction({ hash: sell.hash });
+      assert.equal(
+        buyTx.input.length,
+        sellTx.input.length,
+        "a sell must not be shorter or longer in calldata than a buy",
+      );
+      assert.equal(
+        buyTx.input.slice(0, 10),
+        sellTx.input.slice(0, 10),
+        "both sides go through the same function selector",
+      );
+
+      /**
+       * A transaction's log fingerprint: which contract emitted what kind of event, in what
+       * order, carrying how many bytes. It captures the exact NoxCompute op sequence the intent
+       * triggered (WrapAsPublicHandle, two Selects, two Adds, the ACL grants) while ignoring the
+       * ciphertext handles themselves, which are random by construction.
+       */
+      const fingerprint = (logs: readonly { address: string; topics: readonly string[]; data: string }[]) =>
+        logs
+          .map((log) => `${log.address}:${log.topics[0]}:${log.topics.length}:${log.data.length}`)
+          .join(" | ");
+
+      const buyReceipt = await publicClient.waitForTransactionReceipt({ hash: buy.hash });
+      const sellReceipt = await publicClient.waitForTransactionReceipt({ hash: sell.hash });
+
+      assert.ok(buyReceipt.logs.length > 0);
+      assert.equal(
+        fingerprint(buyReceipt.logs),
+        fingerprint(sellReceipt.logs),
+        "a buy and a sell must trigger the identical op sequence — no residual distinguisher",
+      );
+
+      // Both agents netted: the buy agent to +100 (buy), the sell agent to 100 (sell).
+      const b = await closeEpoch(settler, runtime, buyAgent, 0n);
+      const s = await closeEpoch(settler, runtime, sellAgent, 0n);
+      const revealedBuy = await revealNet(b.net, b.direction);
+      const revealedSell = await revealNet(s.net, s.direction);
+
+      assert.equal(revealedBuy.netPlaintext, 100n * USDC);
+      assert.equal(revealedBuy.netIsBuy, true);
+      assert.equal(revealedSell.netPlaintext, 100n * USDC);
+      assert.equal(
+        revealedSell.netIsBuy,
+        false,
+        "a lone sell nets to a sell — the encrypted side reached the aggregate intact",
+      );
     },
   );
 
@@ -492,11 +688,16 @@ describe("NetSettler", () => {
       const { netPlaintext, netIsBuy, netProof, directionProof } = await revealNet(net, direction);
 
       assert.equal(netPlaintext, 0n, "a fully crossed epoch nets to zero");
-      assert.equal(netIsBuy, true, "ge(buy, sell) holds on equality: zero is reported as a buy");
+      assert.equal(
+        netIsBuy,
+        true,
+        "ge(buy, sell) holds on equality: zero is reported as a buy, and the bit is meaningless",
+      );
 
       // The individual intents that crossed are still sealed — a zero net must not be a
-      // side channel back into who wanted what.
-      assert.equal(await settler.read.isPubliclyDecryptable([alice]), false);
+      // side channel back into who wanted what, in either size or side.
+      assert.equal(await settler.read.isPubliclyDecryptable([alice.amount]), false);
+      assert.equal(await settler.read.isPubliclyDecryptable([alice.side]), false);
 
       const hash = await settler.write.settle([agentId, 0n, netProof, directionProof, 0n], {
         account: runtime.account,
@@ -509,7 +710,8 @@ describe("NetSettler", () => {
       assert.equal(settled.length, 1);
       assert.equal(settled[0].args.netPlaintext, 0n);
 
-      // There is nothing to trade: the executor must not be poked with a zero order.
+      // There is nothing to trade, and the direction bit means nothing on a zero net: the
+      // executor must not be poked with it. (IExecutionTarget documents both facts.)
       assert.equal(await executor.read.callCount(), 0n);
     },
   );
@@ -524,13 +726,15 @@ describe("NetSettler", () => {
 
       // Every entry point is gated before it ever touches a handle or a proof.
       await assertRevertsWithError(
-        settler.write.submitIntent([agentId, ZERO_HANDLE, "0x", true], {
+        settler.write.submitIntent([agentId, ZERO_HANDLE, "0x", ZERO_HANDLE, "0x"], {
           account: mallory.account,
         }),
         "NetSettlerNotAgentRuntime",
       );
       await assertRevertsWithError(
-        settler.write.submitIntent([agentId, ZERO_HANDLE, true], { account: mallory.account }),
+        settler.write.submitIntent([agentId, ZERO_HANDLE, ZERO_HANDLE, "0x"], {
+          account: mallory.account,
+        }),
         "NetSettlerNotAgentRuntime",
       );
       await assertRevertsWithError(
@@ -676,7 +880,12 @@ describe("NetSettler", () => {
         args: [balanceHandle, settler.address],
       });
 
-      await settler.write.submitIntent([agentId, balanceHandle, true], {
+      // THIS is the overload that made a plaintext side attributable: `confidentialBalanceOf` is
+      // a public view keyed by address, so anyone can match the handle folded in here against a
+      // named depositor. The side therefore arrives encrypted here too — there is no overload of
+      // `submitIntent` left that takes a plaintext bool.
+      const side = await nox.encryptInput(true, "bool", settler.address);
+      await settler.write.submitIntent([agentId, balanceHandle, side.handle, side.handleProof], {
         account: runtime.account,
       });
       await submitIntent(settler, runtime, agentId, 20n * USDC, false);
@@ -686,12 +895,19 @@ describe("NetSettler", () => {
       assert.equal(netPlaintext, 60n * USDC, "80 (existing handle) - 20 = 60");
       assert.equal(netIsBuy, true);
 
-      // The pre-existing handle is not made public by being netted.
+      // Neither the pre-existing handle nor the side attached to it is made public by netting.
       assert.equal(await settler.read.isPubliclyDecryptable([balanceHandle]), false);
       assert.equal(
         await settler.read.isAllowedFor([balanceHandle, outsider.account.address]),
         false,
       );
+      assert.equal(await settler.read.isPubliclyDecryptable([side.handle]), false);
+      assert.equal(
+        await settler.read.isAllowedFor([side.handle, outsider.account.address]),
+        false,
+        "the side of a publicly-lookup-able balance handle is exactly what must not leak",
+      );
+      await assertNotPubliclyDecryptable(side.handle, "the side of a pre-existing handle");
     },
   );
 
@@ -720,8 +936,11 @@ describe("NetSettler", () => {
         stranger.account.address,
       ])) as `0x${string}`;
 
+      const side = await nox.encryptInput(true, "bool", settler.address);
       await assertRevertsWithError(
-        settler.write.submitIntent([agentId, strangerHandle, true], { account: runtime.account }),
+        settler.write.submitIntent([agentId, strangerHandle, side.handle, side.handleProof], {
+          account: runtime.account,
+        }),
         "NetSettlerUnauthorizedIntent",
       );
     },

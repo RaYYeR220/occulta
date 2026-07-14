@@ -4,6 +4,7 @@ pragma solidity 0.8.35;
 import {
     ebool,
     euint256,
+    externalEbool,
     externalEuint256
 } from "@iexec-nox/nox-protocol-contracts/contracts/sdk/Nox.sol";
 
@@ -25,14 +26,32 @@ import {
  * Never revealed, ever, to anyone:
  *  - Every individual intent amount. No `allowPublicDecryption` is called on an intent handle,
  *    and no ACL grant on one is issued beyond the settler itself and the agent runtime.
+ *  - Every individual intent SIDE. The side is an `ebool`, not a `bool`: it never appears in
+ *    calldata, in an event, or in storage as a plaintext, and it is folded into the totals
+ *    branchlessly under `Nox.select` (see {NetSettler-_accumulate}). A plaintext side would be
+ *    attributable, not merely abstract: an intent handle can be a pre-existing on-chain
+ *    ciphertext — `IERC7984.confidentialBalanceOf(alice)` is a public view returning exactly such
+ *    a handle — so a plaintext side published next to it would name a depositor's direction.
  *  - `buyTotal` and `sellTotal`. They are components of the aggregate, not the aggregate: if
  *    both were public, an observer could watch a single depositor's intent land between two
  *    epochs and difference them out. Only their netted difference is opened.
  *
- * Structurally visible (and accepted): the number of intents in an epoch, and the plaintext
- * `isBuy` side of each one, which is an ordinary calldata argument selecting the accumulator to
- * fold into. A side without a size is not a position: it cannot be valued, sequenced against a
- * NAV, or netted back out of the aggregate.
+ * Structurally visible (and accepted): the NUMBER of intents in an epoch. Nothing about their
+ * sizes or their sides follows from the count — but the count is not nothing, and the honest
+ * statement of the limit is this:
+ *
+ *   A one-intent epoch reveals that depositor's order exactly (the aggregate IS their intent).
+ *   The aggregation guarantee is therefore CONDITIONAL on the attested runtime batching multiple
+ *   intents per epoch — it is not enforced on-chain.
+ *
+ * There is deliberately no `minIntentsPerEpoch` floor, because such a floor would be theatre. The
+ * runtime already holds an ACL grant on every intent it submits (it knows every plaintext) and it
+ * alone chooses which intents enter an epoch; it could satisfy any floor N by padding with N-1
+ * dummy intents of a size it picked, then subtracting them back out of the revealed aggregate.
+ * The counter would be satisfied and the depositor would be just as exposed. What actually
+ * defends a depositor against a malicious runtime is TEE attestation of the runtime binary — the
+ * guarantee that the code choosing the batch is the code that was audited. This interface
+ * documents that limit rather than pretending a counter closes it.
  *
  * The one-bit direction question. `netDirection` is genuinely secret information right up until
  * the trade prints, so opening it is a real decision, not a technicality. It is opened for two
@@ -54,22 +73,28 @@ interface INetSettler {
 
     /**
      * @notice A depositor's encrypted intent was folded into the open epoch.
-     * @dev `amount` is a HANDLE, not a value. It is emitted so the runtime and the depositor can
-     * audit that their intent was counted; neither this event nor any other path makes it
-     * decryptable by anyone else.
+     * @dev `amount` and `isBuy` are HANDLES, not values. They are emitted so the runtime — the
+     * only party besides this contract holding an ACL grant on them — can audit that the intent
+     * was counted; neither this event nor any other path makes them decryptable by anyone else.
+     * A runtime-minted intent is not decryptable by the depositor it was minted for: the settler
+     * grants no ACL to depositors.
+     *
+     * The event's shape does not depend on the side. A buy and a sell emit the same fields, the
+     * same handle types, and the same number of logs — the side lives inside the `ebool` and
+     * nowhere else.
      * @param agentId The strategy agent the intent was filed against.
      * @param epoch The epoch the intent landed in (always the agent's open epoch).
      * @param controller The account that submitted the intent — always the agent's runtime,
      * which is the only party authorized to route depositor intents into an epoch.
      * @param amount Encrypted intent size. Never revealed.
-     * @param isBuy Side of this individual intent.
+     * @param isBuy Encrypted intent side. Never revealed.
      */
     event IntentSubmitted(
         uint256 indexed agentId,
         uint256 indexed epoch,
         address indexed controller,
         euint256 amount,
-        bool isBuy
+        ebool isBuy
     );
 
     /**
@@ -111,24 +136,40 @@ interface INetSettler {
      * say. The caller must be allowed on `amount`, and this settler must have been granted access
      * to it too (the runtime does so via `NoxCompute.allow`), otherwise the accumulation cannot
      * consume the ciphertext.
+     *
+     * The side is NOT taken as a plaintext here, and this overload is exactly why: the handle
+     * being folded in may be one an observer can look up against a named address, so a plaintext
+     * side would attribute a direction to that depositor. It is supplied as a freshly encrypted
+     * `externalEbool` instead.
      * @param agentId The strategy agent to file the intent against.
-     * @param amount Encrypted intent size.
-     * @param isBuy Side of this intent.
+     * @param amount Encrypted intent size — a handle the caller already holds a grant on.
+     * @param encIsBuy Externally-encrypted intent side: `true` = buy, `false` = sell.
+     * @param sideProof Encryption proof for `encIsBuy`, bound to this settler and to the caller.
      */
-    function submitIntent(uint256 agentId, euint256 amount, bool isBuy) external;
+    function submitIntent(
+        uint256 agentId,
+        euint256 amount,
+        externalEbool encIsBuy,
+        bytes calldata sideProof
+    ) external;
 
     /**
      * @notice Folds a freshly-encrypted intent into the agent's open epoch.
+     * @dev Size and side are both secrets and both arrive the same way: as an external ciphertext
+     * with an encryption proof that NoxCompute validates against this settler and this caller.
      * @param agentId The strategy agent to file the intent against.
      * @param encAmount Externally-encrypted intent size.
-     * @param inputProof Encryption proof for `encAmount`, bound to this settler and to the caller.
-     * @param isBuy Side of this intent.
+     * @param amountProof Encryption proof for `encAmount`, bound to this settler and to the
+     * caller.
+     * @param encIsBuy Externally-encrypted intent side: `true` = buy, `false` = sell.
+     * @param sideProof Encryption proof for `encIsBuy`, bound to this settler and to the caller.
      */
     function submitIntent(
         uint256 agentId,
         externalEuint256 encAmount,
-        bytes calldata inputProof,
-        bool isBuy
+        bytes calldata amountProof,
+        externalEbool encIsBuy,
+        bytes calldata sideProof
     ) external;
 
     // ============ Netting and reveal ============
@@ -150,6 +191,9 @@ interface INetSettler {
      * signature over `(handle, plaintext)`. A proof for a different handle, or a proof whose
      * plaintext payload was altered, fails signature recovery and reverts. The contract therefore
      * never learns a number from its caller — it only ever learns one from the gateway.
+     *
+     * An epoch whose net proves to zero is marked settled and emitted, but is never forwarded to
+     * the execution target: there is no order to place.
      * @param agentId The strategy agent whose epoch to settle.
      * @param epoch The closed epoch to settle.
      * @param decryptionProof Public-decryption proof for the epoch's net magnitude handle.
@@ -185,9 +229,12 @@ interface INetSettler {
     ) external view returns (uint256 intentCount, bool closed, bool settled);
 
     /// @notice Returns whether `who` may decrypt `handle` off-chain.
+    /// @dev A Nox handle is a `bytes32` whatever its encrypted type, so this view answers for an
+    /// intent's `ebool` side exactly as it does for its `euint256` size.
     function isAllowedFor(euint256 handle, address who) external view returns (bool);
 
     /// @notice Returns whether `handle` was marked publicly decryptable. Only an epoch's net
-    /// magnitude and net direction ever are.
+    /// magnitude and net direction ever are — never an intent's size, never an intent's side,
+    /// never a running total.
     function isPubliclyDecryptable(euint256 handle) external view returns (bool);
 }
