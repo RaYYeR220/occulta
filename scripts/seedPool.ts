@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { network } from "hardhat";
-import { formatEther, formatUnits, parseAbi, parseEther, zeroAddress, type Address, type Hash } from "viem";
+import { formatEther, formatUnits, parseAbi, zeroAddress, type Address, type Hash } from "viem";
 
 /**
  * Task 9 — production seeding script for Occulta's own Aave-USDC/Aave-WETH Uniswap V3 pool on
@@ -25,6 +25,37 @@ import { formatEther, formatUnits, parseAbi, parseEther, zeroAddress, type Addre
  * for this pair returned the zero address (genuinely un-created) and
  * factory.feeAmountTickSpacing(10000) == 200, confirming it is an enabled, clean tier.
  *
+ * Funding the position — faucet first, real ETH only as an unavoidable fallback:
+ * Both Aave-USDC and Aave-WETH are, in principle, mintable through the same real, permissionless
+ * Aave testnet Faucet (0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D — `mint(token, to, amount)`,
+ * capped at 10,000 units/call scaled by decimals, looped below if a target ever exceeded one
+ * call). The Faucet exposes its own on-chain `isMintable(token)` flag per asset, and this script
+ * checks it at runtime rather than assuming: for Aave-USDC it is (and stays) true. For Aave-WETH,
+ * a direct on-chain check against live Sepolia (not a guess — an actual `mint(WETH, ...)` call,
+ * both simulated and sent for real on a fork of live state) currently gets
+ * `Error: not mintable`; `Faucet.isMintable(WETH)` reads `false`. Reading the Faucet's verified
+ * source confirms why: it keeps a `_nonMintable` allowlist per token, toggled only by the
+ * Faucet's OWNER (a fixed address this project does not control) via `setMintable`, and Aave-WETH
+ * is currently in that disabled set. Aave-WETH's own `WETH9Mock.mint(address,uint256)` is
+ * separately `onlyOwner`-gated too, with the Faucet contract itself (not this deployer) as that
+ * owner — so there is no back door through the token either. The one genuinely permissionless way
+ * to obtain Aave-WETH that remains is the token's own inherited `deposit()` — real ETH, 1:1, the
+ * actual WETH9 mechanism, not a mock or a workaround.
+ *
+ * So: this script always tries the free faucet path for BOTH tokens first (and will use it
+ * automatically for Aave-WETH too the moment its owner ever flips `isMintable(WETH)` to true —
+ * nothing else about this script would need to change). Until then, Aave-WETH's shortfall is
+ * covered by `deposit()`, and ONLY that shortfall — this is the one part of a run that is not
+ * gas-only, and every code path that touches it says so loudly (console output, the pre-flight
+ * balance check, and the deployment artifact's `wethSource` field).
+ *
+ * Position size: a modest ~2 WETH + 6,000 USDC (previously 10 WETH + 20,000 USDC) — this pool
+ * only needs to be deep enough for the demo's own swaps to land at a sane price with acceptable
+ * slippage, not deeply liquid, and a smaller target keeps any live `deposit()` fallback as cheap
+ * as it can possibly be. 6,000 / 2 = 3,000 USDC per WETH, exactly the target price below, so the
+ * mint is NOT lopsided — both sides are fully consumed, unlike a mismatched ratio that would
+ * silently leave one side over-supplied and shift the pool off its intended price.
+ *
  * Safe to re-run: this script checks on-chain state before writing anything (createPool/mint) and
  * exits without spending gas if a correctly-priced pool already exists — see step 2 below.
  *
@@ -43,20 +74,21 @@ const POSITION_MANAGER: Address = "0x1238536071E1c677A632429e3655c799b22cDA52";
  * coherence between the lending leg and the swap leg of the demo. */
 const FAUCET: Address = "0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D";
 const USDC: Address = "0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8"; // 6 decimals
-const WETH: Address = "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c"; // 18 decimals, payable deposit()
+const WETH: Address = "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c"; // 18 decimals, WETH9Mock
 const USDC_DECIMALS = 6;
 const WETH_DECIMALS = 18;
 
 const FEE_TIER = 10000; // 1% — see the fee-tier note above.
 
-/** Faucet is capped at 10,000 units/call (scaled by decimals); this script loops to reach the
- * target instead of assuming a single call suffices. */
-const FAUCET_MINT_CAP = 10_000n * 10n ** BigInt(USDC_DECIMALS); // 10,000 USDC per call
+/** Faucet is capped at 10,000 units/call (scaled by decimals); the loop below reaches the target
+ * instead of assuming a single call suffices, though at this script's position size both tokens'
+ * targets fit comfortably inside one call each. */
+const faucetCapFor = (decimals: number): bigint => 10_000n * 10n ** BigInt(decimals);
 
-/** Target liquidity offered to the position. Chosen to match the fork test this script
- * productionises, giving the pool enough depth that a demo-sized swap has modest price impact. */
-const USDC_SEED_TARGET = 20_000n * 10n ** BigInt(USDC_DECIMALS); // 20,000 USDC
-const WETH_SEED_TARGET = 10n * 10n ** BigInt(WETH_DECIMALS); // 10 WETH
+/** Target liquidity offered to the position — a modest, demo-sized depth, not deep liquidity. See
+ * the "Position size" note above for why these two numbers are chosen together. */
+const USDC_SEED_TARGET = 6_000n * 10n ** BigInt(USDC_DECIMALS); // 6,000 USDC
+const WETH_SEED_TARGET = 2n * 10n ** BigInt(WETH_DECIMALS); // 2 WETH
 
 /**
  * `sqrtPriceX96` derivation for token0 = Aave-USDC (6 decimals), token1 = Aave-WETH (18
@@ -113,13 +145,20 @@ const TICK_UPPER = 887200;
  * price and wide enough to absorb this pool's own price impact and any real trading that has
  * happened against it since — while still catching a wrong-order-of-magnitude sqrtPriceX96 (the
  * live 3000-fee pool for this pair is mispriced by ~800x, so even a generous band like this one
- * catches that class of failure easily). */
+ * catches that class of failure easily). Expressed as "per 1 WETH" / "per 1,000 USDC" regardless
+ * of how large the actual test trade below is — see checkQuotesSane for the scaling. */
 const MIN_USDC_PER_ONE_WETH = 2_000n * 10n ** BigInt(USDC_DECIMALS);
 const MAX_USDC_PER_ONE_WETH = 4_000n * 10n ** BigInt(USDC_DECIMALS);
 const MIN_WETH_PER_1000_USDC = (250n * 10n ** BigInt(WETH_DECIMALS)) / 1000n; // 0.25 WETH
 const MAX_WETH_PER_1000_USDC = (500n * 10n ** BigInt(WETH_DECIMALS)) / 1000n; // 0.50 WETH
 
-const GAS_BUFFER = parseEther("0.05");
+/** Gas budget for a full seeding run: faucet mint(s) and/or a deposit() fallback for WETH, one
+ * faucet mint for USDC, two approvals, createAndInitializePoolIfNecessary (deploys a full pool
+ * contract — by far the largest single cost here), and the position mint. An actual `sepoliaFork`
+ * run of this exact script summed ~1.84M gas units across all six transactions (see the Task 9
+ * report for the receipts); this budget keeps roughly 35% margin over that observed total for
+ * live gas-usage variance. */
+const ESTIMATED_GAS_UNITS = 2_500_000n;
 
 const erc20Abi = parseAbi([
   "function balanceOf(address account) view returns (uint256)",
@@ -128,9 +167,13 @@ const erc20Abi = parseAbi([
 
 const faucetAbi = parseAbi([
   "function mint(address token, address to, uint256 amount) returns (uint256)",
+  "function isMintable(address asset) view returns (bool)",
 ]);
 
-const wethAbi = parseAbi(["function deposit() payable"]);
+/** Aave-WETH's own inherited WETH9 `deposit()` — the sole remaining permissionless (but NOT
+ * free) path to acquire it while the Faucet has it marked non-mintable. See the file header for
+ * the on-chain evidence behind that "while." */
+const wethDepositAbi = parseAbi(["function deposit() payable"]);
 
 const factoryAbi = parseAbi([
   "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)",
@@ -175,6 +218,10 @@ async function main() {
   const readBalance = (token: Address, owner: Address) =>
     publicClient.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
 
+  let gasSpent = 0n; // running total of real gas cost (gasUsed * effectiveGasPrice) across every
+  // transaction this run actually sends — printed in the summary as the true, observed cost
+  // alongside the pre-flight estimate above.
+
   const writeAndWait = async (label: string, send: () => Promise<Hash>): Promise<Hash> => {
     const hash = await send();
     console.log(`  ${label}: tx ${hash} submitted, waiting for confirmation...`);
@@ -182,35 +229,47 @@ async function main() {
     if (receipt.status !== "success") {
       throw new Error(`${label} reverted (tx ${hash})`);
     }
+    gasSpent += receipt.gasUsed * receipt.effectiveGasPrice;
     console.log(`  ${label}: confirmed in block ${receipt.blockNumber}`);
     return hash;
   };
 
   const checkQuotesSane = async (context: string): Promise<Quotes> => {
-    let wethToUsdc: bigint;
-    let usdcToWeth: bigint;
     const oneWeth = 10n ** BigInt(WETH_DECIMALS);
     const oneThousandUsdc = 1_000n * 10n ** BigInt(USDC_DECIMALS);
+    // Keep the actual test trade small relative to this script's own (deliberately modest)
+    // seeded depth — 10% of each side's target — so the check's OWN price impact can never itself
+    // approach the sane-band edges below; the raw quote is then scaled back up to a "per whole
+    // token" implied price before comparing against the band, so the band keeps meaning exactly
+    // what it always did (USDC per 1 WETH / WETH per 1,000 USDC) regardless of how large the
+    // underlying pool actually is.
+    const testWethIn = WETH_SEED_TARGET / 10n;
+    const testUsdcIn = USDC_SEED_TARGET / 10n;
+
+    let wethToUsdcRaw: bigint;
+    let usdcToWethRaw: bigint;
 
     try {
       const quote = await publicClient.simulateContract({
         address: QUOTER_V2,
         abi: quoterAbi,
         functionName: "quoteExactInputSingle",
-        args: [{ tokenIn: WETH, tokenOut: USDC, amountIn: oneWeth, fee: FEE_TIER, sqrtPriceLimitX96: 0n }],
+        args: [{ tokenIn: WETH, tokenOut: USDC, amountIn: testWethIn, fee: FEE_TIER, sqrtPriceLimitX96: 0n }],
         account: deployer.account,
       });
-      [wethToUsdc] = quote.result;
+      [wethToUsdcRaw] = quote.result;
     } catch (err) {
       throw new Error(
         `${context}: QuoterV2 WETH->USDC quote failed — the pool may have no liquidity or be otherwise ` +
           `unusable. Aborting; not attempting to fix a broken pool. Underlying error: ${String(err)}`,
       );
     }
+    const wethToUsdc = (wethToUsdcRaw * oneWeth) / testWethIn;
     if (!(wethToUsdc > MIN_USDC_PER_ONE_WETH && wethToUsdc < MAX_USDC_PER_ONE_WETH)) {
       throw new Error(
-        `${context}: pool is MISPRICED — quoted ${formatUnits(wethToUsdc, USDC_DECIMALS)} USDC for 1 WETH, ` +
-          `expected between ${formatUnits(MIN_USDC_PER_ONE_WETH, USDC_DECIMALS)} and ` +
+        `${context}: pool is MISPRICED — quoted ${formatUnits(wethToUsdcRaw, USDC_DECIMALS)} USDC for ` +
+          `${formatEther(testWethIn)} WETH (implied ${formatUnits(wethToUsdc, USDC_DECIMALS)} USDC per 1 WETH), ` +
+          `expected the implied price between ${formatUnits(MIN_USDC_PER_ONE_WETH, USDC_DECIMALS)} and ` +
           `${formatUnits(MAX_USDC_PER_ONE_WETH, USDC_DECIMALS)} USDC. Aborting; NOT attempting to fix a ` +
           `mispriced live pool.`,
       );
@@ -221,22 +280,23 @@ async function main() {
         address: QUOTER_V2,
         abi: quoterAbi,
         functionName: "quoteExactInputSingle",
-        args: [
-          { tokenIn: USDC, tokenOut: WETH, amountIn: oneThousandUsdc, fee: FEE_TIER, sqrtPriceLimitX96: 0n },
-        ],
+        args: [{ tokenIn: USDC, tokenOut: WETH, amountIn: testUsdcIn, fee: FEE_TIER, sqrtPriceLimitX96: 0n }],
         account: deployer.account,
       });
-      [usdcToWeth] = quote.result;
+      [usdcToWethRaw] = quote.result;
     } catch (err) {
       throw new Error(
         `${context}: QuoterV2 USDC->WETH quote failed — the pool may have no liquidity or be otherwise ` +
           `unusable. Aborting; not attempting to fix a broken pool. Underlying error: ${String(err)}`,
       );
     }
+    const usdcToWeth = (usdcToWethRaw * oneThousandUsdc) / testUsdcIn;
     if (!(usdcToWeth > MIN_WETH_PER_1000_USDC && usdcToWeth < MAX_WETH_PER_1000_USDC)) {
       throw new Error(
-        `${context}: pool is MISPRICED — quoted ${formatUnits(usdcToWeth, WETH_DECIMALS)} WETH for 1,000 ` +
-          `USDC, expected between ${formatUnits(MIN_WETH_PER_1000_USDC, WETH_DECIMALS)} and ` +
+        `${context}: pool is MISPRICED — quoted ${formatUnits(usdcToWethRaw, WETH_DECIMALS)} WETH for ` +
+          `${formatUnits(testUsdcIn, USDC_DECIMALS)} USDC (implied ${formatUnits(usdcToWeth, WETH_DECIMALS)} WETH ` +
+          `per 1,000 USDC), expected the implied price between ` +
+          `${formatUnits(MIN_WETH_PER_1000_USDC, WETH_DECIMALS)} and ` +
           `${formatUnits(MAX_WETH_PER_1000_USDC, WETH_DECIMALS)} WETH. Aborting; NOT attempting to fix a ` +
           `mispriced live pool.`,
       );
@@ -251,6 +311,7 @@ async function main() {
     createdThisRun: boolean;
     txHashes: Record<string, Hash>;
     amountsDeposited?: { usdc: bigint; weth: bigint };
+    wethSource?: "faucet" | "deposit-fallback";
   }) => {
     const scriptDir = path.dirname(fileURLToPath(import.meta.url));
     const outDir = path.join(scriptDir, "..", "deployments");
@@ -288,6 +349,10 @@ async function main() {
       amountsDeposited: args.amountsDeposited
         ? { usdc: args.amountsDeposited.usdc.toString(), weth: args.amountsDeposited.weth.toString() }
         : undefined,
+      // "faucet" if the Aave Faucet minted the WETH leg for free; "deposit-fallback" if it had to
+      // be wrapped from real ETH because Faucet.isMintable(WETH) was false at seed time — see the
+      // file header. Omitted when no seeding happened this run (idempotent exit).
+      wethSource: args.wethSource,
       txHashes: args.txHashes,
     };
 
@@ -320,59 +385,112 @@ async function main() {
   // 1 (deferred). Only require enough ETH once we know we actually have to spend it: the
   // gas-free idempotent-exit path above must never be blocked by an underfunded wallet, since it
   // spends nothing. From here on we are committed to writing, so check now.
+  //
+  // Whether real ETH beyond gas is needed at all depends entirely on the Faucet's own current
+  // isMintable(WETH) flag — a free view read, so checking it costs nothing and lets the balance
+  // check below assert the true requirement instead of assuming the worst (or the best) case.
+  const wethFaucetMintable = await publicClient.readContract({
+    address: FAUCET,
+    abi: faucetAbi,
+    functionName: "isMintable",
+    args: [WETH],
+  });
+  console.log(`\nFaucet.isMintable(WETH): ${wethFaucetMintable}`);
+  if (!wethFaucetMintable) {
+    console.log(
+      `  the Aave Faucet currently has Aave-WETH marked non-mintable (only its owner can change ` +
+        `this via setMintable — not this deployer). Falling back to WETH9Mock.deposit() for the ` +
+        `WETH shortfall ONLY: real ETH, 1:1, the one part of this run that is not gas-only. If the ` +
+        `Faucet owner ever enables WETH minting, this script picks the free path automatically and ` +
+        `this fallback never triggers again.`,
+    );
+  }
+
   const usdcBalanceBeforeMint = await readBalance(USDC, deployer.account.address);
   const wethBalanceBeforeMint = await readBalance(WETH, deployer.account.address);
   const wethShortfall =
     WETH_SEED_TARGET > wethBalanceBeforeMint ? WETH_SEED_TARGET - wethBalanceBeforeMint : 0n;
-  const ethNeeded = wethShortfall + GAS_BUFFER;
+  const wethDepositNeeded = wethFaucetMintable ? 0n : wethShortfall;
+
+  const gasPrice = await publicClient.getGasPrice();
+  const estimatedGasCost = ESTIMATED_GAS_UNITS * gasPrice;
+  console.log(
+    `estimated gas cost for this run: ~${formatEther(estimatedGasCost)} ETH ` +
+      `(${ESTIMATED_GAS_UNITS.toLocaleString("en-US")} gas units @ ${formatUnits(gasPrice, 9)} gwei)`,
+  );
+
+  const ethNeeded = wethDepositNeeded + estimatedGasCost;
   if (ethBalance < ethNeeded) {
     throw new Error(
-      `deployer ETH balance too low to seed the pool: have ${formatEther(ethBalance)} ETH, need at least ` +
-        `${formatEther(ethNeeded)} ETH (${formatEther(wethShortfall)} ETH to wrap into Aave-WETH via ` +
-        `deposit(), plus a ${formatEther(GAS_BUFFER)} ETH gas buffer). Fund ${deployer.account.address} ` +
-        `and retry.`,
+      wethDepositNeeded > 0n
+        ? `deployer ETH balance too low to seed the pool: have ${formatEther(ethBalance)} ETH, need at ` +
+          `least ${formatEther(ethNeeded)} ETH (${formatEther(wethDepositNeeded)} ETH to wrap the WETH ` +
+          `shortfall via deposit() — the Faucet cannot mint WETH right now, see above — plus an ` +
+          `estimated ${formatEther(estimatedGasCost)} ETH in gas). Fund ${deployer.account.address} and retry.`
+        : `deployer ETH balance too low to cover this run's gas: have ${formatEther(ethBalance)} ETH, need ` +
+          `at least ${formatEther(ethNeeded)} ETH, all of it gas — both tokens are faucet-minted, no ` +
+          `ETH-wrapping is needed. Fund ${deployer.account.address} and retry.`,
     );
   }
 
   const txHashes: Record<string, Hash> = {};
 
-  // 3. Faucet-mint the needed Aave-USDC (10,000-units-per-call cap; loop until the target is
-  // met). Prefer wrapping ETH via Aave-WETH's own deposit() for WETH — it is direct (one call,
-  // no per-call cap) versus the faucet route, which the real faucet contract rejects for WETH
-  // anyway ("not mintable"; only USDC is faucet-mintable on this deployment).
-  let usdcBalance = usdcBalanceBeforeMint;
-  console.log(`\ndeployer USDC balance: ${formatUnits(usdcBalance, USDC_DECIMALS)}`);
-  let faucetCallIndex = 0;
-  while (usdcBalance < USDC_SEED_TARGET) {
-    const remaining = USDC_SEED_TARGET - usdcBalance;
-    const mintAmount = remaining < FAUCET_MINT_CAP ? remaining : FAUCET_MINT_CAP;
-    const hash = await writeAndWait(
-      `faucet mint ${formatUnits(mintAmount, USDC_DECIMALS)} USDC`,
-      () =>
+  // 3. Faucet-mint whatever the Faucet will actually mint (10,000-units-per-call cap, scaled by
+  // decimals; loops until the target is met — though at this script's position size, both
+  // targets fit inside one call).
+  const faucetMint = async (token: Address, decimals: number, target: bigint, label: string): Promise<bigint> => {
+    const cap = faucetCapFor(decimals);
+    let balance = await readBalance(token, deployer.account.address);
+    let callIndex = 0;
+    while (balance < target) {
+      const remaining = target - balance;
+      const amount = remaining < cap ? remaining : cap;
+      const hash = await writeAndWait(`faucet mint ${formatUnits(amount, decimals)} ${label}`, () =>
         deployer.writeContract({
           address: FAUCET,
           abi: faucetAbi,
           functionName: "mint",
-          args: [USDC, deployer.account.address, mintAmount],
+          args: [token, deployer.account.address, amount],
         }),
-    );
-    txHashes[`faucetMintUsdc${faucetCallIndex}`] = hash;
-    faucetCallIndex += 1;
-    usdcBalance += mintAmount;
-  }
+      );
+      txHashes[`faucetMint${label}${callIndex}`] = hash;
+      callIndex += 1;
+      balance += amount;
+    }
+    return balance;
+  };
+
+  console.log(`\ndeployer USDC balance: ${formatUnits(usdcBalanceBeforeMint, USDC_DECIMALS)}`);
+  const usdcBalance = await faucetMint(USDC, USDC_DECIMALS, USDC_SEED_TARGET, "Usdc");
   console.log(`deployer USDC balance now: ${formatUnits(usdcBalance, USDC_DECIMALS)}`);
 
-  // Wrap ETH into Aave-WETH for whatever shortfall remains.
+  // WETH: free faucet path if the Faucet currently allows it, real deposit() wrap for the
+  // shortfall only otherwise — see the pre-flight check above for why.
+  console.log(`deployer WETH balance: ${formatUnits(wethBalanceBeforeMint, WETH_DECIMALS)}`);
   let wethBalance = wethBalanceBeforeMint;
-  console.log(`deployer WETH balance: ${formatUnits(wethBalance, WETH_DECIMALS)}`);
-  if (wethShortfall > 0n) {
-    const hash = await writeAndWait(`wrap ${formatEther(wethShortfall)} ETH into Aave-WETH`, () =>
-      deployer.writeContract({ address: WETH, abi: wethAbi, functionName: "deposit", args: [], value: wethShortfall }),
-    );
-    txHashes.wrapWeth = hash;
-    wethBalance += wethShortfall;
+  let wethSource: "faucet" | "deposit-fallback";
+  if (wethFaucetMintable) {
+    wethBalance = await faucetMint(WETH, WETH_DECIMALS, WETH_SEED_TARGET, "Weth");
+    wethSource = "faucet";
+  } else {
+    wethSource = "deposit-fallback";
+    if (wethShortfall > 0n) {
+      const hash = await writeAndWait(
+        `wrap ${formatEther(wethShortfall)} ETH into Aave-WETH via deposit() (faucet fallback)`,
+        () =>
+          deployer.writeContract({
+            address: WETH,
+            abi: wethDepositAbi,
+            functionName: "deposit",
+            args: [],
+            value: wethShortfall,
+          }),
+      );
+      txHashes.wethDepositFallback = hash;
+      wethBalance += wethShortfall;
+    }
   }
-  console.log(`deployer WETH balance now: ${formatUnits(wethBalance, WETH_DECIMALS)}`);
+  console.log(`deployer WETH balance now: ${formatUnits(wethBalance, WETH_DECIMALS)} (source: ${wethSource})`);
 
   // 4/5. Approve both tokens to the position manager, then create+initialize the pool and mint a
   // wide-range position.
@@ -462,7 +580,12 @@ async function main() {
   console.log(`fee tier:           ${FEE_TIER}`);
   console.log(`tick range:         ${TICK_LOWER} .. ${TICK_UPPER}`);
   console.log(`USDC deposited:     ${formatUnits(amountsDeposited.usdc, USDC_DECIMALS)}`);
-  console.log(`WETH deposited:     ${formatUnits(amountsDeposited.weth, WETH_DECIMALS)}`);
+  console.log(`WETH deposited:     ${formatUnits(amountsDeposited.weth, WETH_DECIMALS)} (source: ${wethSource})`);
+  console.log(
+    `gas spent (real):   ${formatEther(gasSpent)} ETH${
+      wethSource === "deposit-fallback" ? " — excludes the WETH deposit()'s ETH value, gas only" : ""
+    }`,
+  );
   console.log(`quote 1 WETH ->     ${formatUnits(quotes.wethToUsdc, USDC_DECIMALS)} USDC`);
   console.log(`quote 1,000 USDC -> ${formatUnits(quotes.usdcToWeth, WETH_DECIMALS)} WETH`);
   console.log(`transactions:`);
@@ -470,7 +593,7 @@ async function main() {
     console.log(`  ${label}: ${hash}`);
   }
 
-  await writeArtifact({ poolAddress, quotes, createdThisRun: true, txHashes, amountsDeposited });
+  await writeArtifact({ poolAddress, quotes, createdThisRun: true, txHashes, amountsDeposited, wethSource });
 }
 
 main().catch((err) => {
