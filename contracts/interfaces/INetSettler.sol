@@ -73,28 +73,25 @@ interface INetSettler {
 
     /**
      * @notice A depositor's encrypted intent was folded into the open epoch.
-     * @dev `amount` and `isBuy` are HANDLES, not values. They are emitted so the runtime — the
-     * only party besides this contract holding an ACL grant on them — can audit that the intent
-     * was counted; neither this event nor any other path makes them decryptable by anyone else.
-     * A runtime-minted intent is not decryptable by the depositor it was minted for: the settler
-     * grants no ACL to depositors.
+     * @dev Deliberately carries NO encrypted handle — neither the intent's size nor its side. An
+     * on-chain handle is a deterministic `bytes32`, and address-keyed public views
+     * (`IERC7984.confidentialBalanceOf(alice)`) return exactly such a handle; emitting an intent's
+     * amount handle would let an observer match it against a named depositor — the very linkage
+     * attack the sealed side exists to defeat, re-entering through the size. The handle also
+     * serves no authorized consumer: the runtime that submitted the intent already holds both the
+     * ACL grant and the plaintext, so nothing legitimate needs it re-emitted. Only plaintext
+     * metadata is kept, and `controller` is already a public address (an accepted metadata limit).
      *
-     * The event's shape does not depend on the side. A buy and a sell emit the same fields, the
-     * same handle types, and the same number of logs — the side lives inside the `ebool` and
-     * nowhere else.
+     * The event's shape does not depend on the side: a buy and a sell emit the identical event.
      * @param agentId The strategy agent the intent was filed against.
      * @param epoch The epoch the intent landed in (always the agent's open epoch).
      * @param controller The account that submitted the intent — always the agent's runtime,
      * which is the only party authorized to route depositor intents into an epoch.
-     * @param amount Encrypted intent size. Never revealed.
-     * @param isBuy Encrypted intent side. Never revealed.
      */
     event IntentSubmitted(
         uint256 indexed agentId,
         uint256 indexed epoch,
-        address indexed controller,
-        euint256 amount,
-        ebool isBuy
+        address indexed controller
     );
 
     /**
@@ -141,6 +138,16 @@ interface INetSettler {
      * being folded in may be one an observer can look up against a named address, so a plaintext
      * side would attribute a direction to that depositor. It is supplied as a freshly encrypted
      * `externalEbool` instead.
+     *
+     * Privacy guidance. Depositor intents SHOULD instead use the fresh-encryption
+     * `externalEuint256` overload below: a post-`fromExternal` handle is a random ciphertext,
+     * unlinkable to any address-keyed public view. The attested runtime MUST never fold an
+     * address-keyed handle — a depositor's vault balance handle, say — directly into this
+     * overload, precisely because that handle is matchable against a named depositor off-chain.
+     * This path exists for handles the runtime legitimately holds and that are NOT address-keyed
+     * lookups; the size handle is no longer re-emitted anywhere ({IntentSubmitted} carries no
+     * handle), so it is never itself a fingerprint, but the folded-in handle's own provenance is
+     * the runtime's responsibility.
      * @param agentId The strategy agent to file the intent against.
      * @param amount Encrypted intent size — a handle the caller already holds a grant on.
      * @param encIsBuy Externally-encrypted intent side: `true` = buy, `false` = sell.

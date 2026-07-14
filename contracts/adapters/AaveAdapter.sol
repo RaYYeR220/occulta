@@ -79,6 +79,10 @@ contract AaveAdapter is Ownable {
     /// failing fast here keeps the revert reason specific to this contract.
     error AaveAdapterZeroAmount();
 
+    /// @notice Thrown by {renounceOwnership}: this adapter holds real funds and real Aave
+    /// positions gated behind `onlyOwner`, so ownership must never be dropped to `address(0)`.
+    error RenounceDisabled();
+
     /**
      * @param pool_ The real Aave V3 Pool. Never `address(0)`.
      * @param initialOwner_ The settler/agent runtime authorized to drive this adapter.
@@ -86,6 +90,16 @@ contract AaveAdapter is Ownable {
     constructor(IAavePool pool_, address initialOwner_) Ownable(initialOwner_) {
         require(address(pool_) != address(0), AaveAdapterZeroPool());
         pool = pool_;
+    }
+
+    /**
+     * @notice Renouncing ownership is permanently disabled.
+     * @dev Every mutating entry point (supply/withdraw/borrow/repay/sweep) is `onlyOwner`;
+     * dropping the owner to `address(0)` would freeze this adapter's funds and Aave position
+     * with no recovery. `transferOwnership` stays intact so the executor can be handed control.
+     */
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /**

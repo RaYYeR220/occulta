@@ -771,4 +771,246 @@ describe("OccultaVault", () => {
       );
     },
   );
+
+  it(
+    "cancelDeposit: pending assets return to the controller, buckets/counter zero, NAV invariant holds",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [signer] = await viem.getWalletClients();
+      const { underlying, asset, vault } = await deployVault(viem, signer);
+
+      const balanceHandle = await prepDeposit(asset, vault, underlying, signer, AMOUNT);
+      await vault.write.requestDeposit(
+        [balanceHandle, signer.account.address, signer.account.address],
+        { account: signer.account },
+      );
+
+      // Post-request: the assets sit in the vault, the depositor's confidential balance is drained.
+      assert.equal(
+        await decryptAmount(
+          (await asset.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "the depositor's assets moved into the vault at request time",
+      );
+
+      await vault.write.cancelDeposit([signer.account.address], { account: signer.account });
+
+      // The pending assets came back to the controller...
+      assert.equal(
+        await decryptAmount(
+          (await asset.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "cancel returns the full pending deposit to the controller",
+      );
+      // ...the pending bucket and the global inflight counter are both zeroed...
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.pendingDepositRequest([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "the pending deposit bucket is emptied",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.totalPendingDepositAssets()) as `0x${string}`,
+        ),
+        0n,
+        "the global inflight counter is decremented by the cancelled amount",
+      );
+
+      // ...and the NAV invariant survives the cancel.
+      const totalAssets = await decryptAmount(
+        (await vault.read.confidentialTotalAssets()) as `0x${string}`,
+      );
+      const totalPending = await decryptAmount(
+        (await vault.read.totalPendingDepositAssets()) as `0x${string}`,
+      );
+      const totalClaimableRedeem = await decryptAmount(
+        (await vault.read.totalClaimableRedeemAssets()) as `0x${string}`,
+      );
+      assert.ok(
+        totalAssets >= totalPending + totalClaimableRedeem,
+        `NAV invariant broken: assets ${totalAssets} < pending ${totalPending} + claimableRedeem ${totalClaimableRedeem}`,
+      );
+    },
+  );
+
+  it(
+    "cancelDeposit cannot pull an already-approved (claimable) bucket",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [signer] = await viem.getWalletClients();
+      const { underlying, asset, vault } = await deployVault(viem, signer);
+
+      const balanceHandle = await prepDeposit(asset, vault, underlying, signer, AMOUNT);
+      await vault.write.requestDeposit(
+        [balanceHandle, signer.account.address, signer.account.address],
+        { account: signer.account },
+      );
+      const pendingHandle = (await vault.read.pendingDepositRequest([
+        signer.account.address,
+      ])) as `0x${string}`;
+      await vault.write.approveDeposit([pendingHandle, signer.account.address], {
+        account: signer.account,
+      });
+
+      // Pending is now zero and the assets are productive (claimable). A cancel must be a no-op
+      // on the claimable bucket — it may only ever touch pending.
+      await vault.write.cancelDeposit([signer.account.address], { account: signer.account });
+
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.claimableDepositRequest([signer.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "the approved/claimable bucket must survive a cancel untouched",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await asset.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "cancel must not return approved funds — pending was already empty",
+      );
+
+      // The claim still works: the depositor gets exactly the shares approveDeposit minted.
+      await vault.write.deposit([signer.account.address, signer.account.address], {
+        account: signer.account,
+      });
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        AMOUNT * SEED_SHARE_MULTIPLIER,
+        "the approved deposit is still fully claimable after a cancel",
+      );
+    },
+  );
+
+  it(
+    "cancelRedeem: escrowed shares return to the controller, pending redeem zeroed, NAV invariant holds",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const { signer, vault } = await setupDepositedVault(viem, AMOUNT);
+
+      const sharesHandle = (await vault.read.confidentialBalanceOf([
+        signer.account.address,
+      ])) as `0x${string}`;
+      const shares = await decryptAmount(sharesHandle);
+      assert.equal(shares, AMOUNT * SEED_SHARE_MULTIPLIER);
+
+      await grantHandle(signer, sharesHandle, vault.address);
+      await vault.write.requestRedeem(
+        [sharesHandle, signer.account.address, signer.account.address],
+        { account: signer.account },
+      );
+
+      // Escrowed: the shares now sit at the vault, the pending redeem bucket holds them.
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "shares moved into the vault at redeem-request time",
+      );
+
+      await vault.write.cancelRedeem([signer.account.address], { account: signer.account });
+
+      // The escrowed shares came back...
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.confidentialBalanceOf([signer.account.address])) as `0x${string}`,
+        ),
+        shares,
+        "cancel returns the full escrowed share amount to the controller",
+      );
+      // ...the pending redeem bucket is empty, and the claimable redeem bucket was never touched.
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.pendingRedeemRequest([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "the pending redeem bucket is emptied",
+      );
+      assert.equal(
+        await decryptAmount(
+          (await vault.read.claimableRedeemRequest([signer.account.address])) as `0x${string}`,
+        ),
+        0n,
+        "no claimable redeem bucket was created or drained",
+      );
+
+      const totalAssets = await decryptAmount(
+        (await vault.read.confidentialTotalAssets()) as `0x${string}`,
+      );
+      const totalPending = await decryptAmount(
+        (await vault.read.totalPendingDepositAssets()) as `0x${string}`,
+      );
+      const totalClaimableRedeem = await decryptAmount(
+        (await vault.read.totalClaimableRedeemAssets()) as `0x${string}`,
+      );
+      assert.ok(
+        totalAssets >= totalPending + totalClaimableRedeem,
+        `NAV invariant broken: assets ${totalAssets} < pending ${totalPending} + claimableRedeem ${totalClaimableRedeem}`,
+      );
+    },
+  );
+
+  it(
+    "cancel authorization: a third party cannot cancel another controller's deposit or redeem",
+    { timeout: 240_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [agent, alice, mallory] = await viem.getWalletClients();
+      const stack = await deployVault(viem, agent);
+      const { underlying, asset, vault } = stack;
+
+      // Alice files a pending deposit; Mallory tries to cancel it and claw the assets.
+      const balanceHandle = await prepDeposit(asset, vault, underlying, alice, AMOUNT);
+      await vault.write.requestDeposit(
+        [balanceHandle, alice.account.address, alice.account.address],
+        { account: alice.account },
+      );
+      await assertRevertsWithError(
+        vault.write.cancelDeposit([alice.account.address], { account: mallory.account }),
+        "ERC7984UnauthorizedSpender",
+      );
+      assert.equal(
+        await decryptAs(
+          alice,
+          agent,
+          (await vault.read.pendingDepositRequest([alice.account.address])) as `0x${string}`,
+        ),
+        AMOUNT,
+        "Alice's pending deposit survives the unauthorized cancel",
+      );
+
+      // Alice completes the deposit and files a pending redeem; Mallory tries to cancel that too.
+      await vault.write.approveDeposit(
+        [(await vault.read.pendingDepositRequest([alice.account.address])) as `0x${string}`, alice.account.address],
+        { account: agent.account },
+      );
+      await vault.write.deposit([alice.account.address, alice.account.address], {
+        account: alice.account,
+      });
+      await requestFullRedeem(stack, alice);
+      await assertRevertsWithError(
+        vault.write.cancelRedeem([alice.account.address], { account: mallory.account }),
+        "ERC7984UnauthorizedSpender",
+      );
+      assert.ok(
+        (await decryptAs(
+          alice,
+          agent,
+          (await vault.read.pendingRedeemRequest([alice.account.address])) as `0x${string}`,
+        )) > 0n,
+        "Alice's pending redeem survives the unauthorized cancel",
+      );
+    },
+  );
 });

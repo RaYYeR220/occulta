@@ -101,6 +101,8 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
     error OccultaVaultSyncEntryPointDisabled();
     /// @dev Thrown when a request names the vault itself as the funds owner — see {_requestDeposit}.
     error OccultaVaultSelfRequest();
+    /// @dev Thrown by {renounceOwnership}: renouncing would permanently strand deposited value.
+    error RenounceDisabled();
 
     // ============ Constructor ============
 
@@ -120,6 +122,20 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         _totalClaimableRedeemAssets = zero;
         Nox.allowThis(zero);
         Nox.allow(zero, initialOwner_);
+    }
+
+    // ============ Ownership ============
+
+    /**
+     * @notice Renouncing ownership is permanently disabled on this vault.
+     * @dev `approveDeposit` / `approveRedeem` are the ONLY path from a pending request to a
+     * claimable one and are `onlyOwner`, and there is no on-chain path that lets the agent's
+     * authority pass to `address(0)` safely. A renounce would set the owner to `address(0)` and
+     * lock 100% of every depositor's pending value forever. `transferOwnership` is deliberately
+     * left intact (the agent runtime key can still be rotated).
+     */
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     // ============ Disable sync entry points ============
@@ -424,11 +440,14 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
      * the escrowed shares were burned at `approveRedeem` time; this call is a pure
      * `_transferOut` with no NAV calculation.
      *
-     * Shortfall-safe: `_transferOut` clamps to the vault's actual balance and returns the amount
-     * genuinely sent, so the asset bucket is set to the RESIDUAL (`assets - sent`) rather than
-     * zeroed. A short balance therefore parks the remainder for a later re-claim instead of
-     * silently destroying it. The share bucket — a settled-amount receipt, never re-spent — is
-     * closed out in full.
+     * Shortfall-safe, all-or-nothing: `_transferOut` routes through ERC-7984's optimized
+     * primitive, which is all-or-nothing — on a short vault balance `transferred == 0` and
+     * balances are left untouched (never a partial clamp). So `sent` is either the full claim or
+     * zero, and the asset bucket is set to the RESIDUAL (`assets - sent`): either zeroed (full
+     * success) or left holding the ENTIRE claim (shortfall), re-claimable in full later — never
+     * silently destroyed. `_totalClaimableRedeemAssets` is decremented by `sent` alone, so a
+     * shortfall leaves the earmark intact. The share bucket — a settled-amount receipt, never
+     * re-spent — is closed out in full.
      */
     function redeem(address receiver, address controller) external override returns (euint256 assets) {
         require(controller != address(0), OccultaVaultZeroAddress());
@@ -460,6 +479,79 @@ contract OccultaVault is ERC7984, IOccultaVault, Ownable {
         Nox.allow(newTotalClaimableRedeem, owner());
 
         emit RedeemClaimed(controller, receiver, sent);
+    }
+
+    // ============ Cancel Phase (EIP-7540 escape hatches) ============
+
+    /**
+     * @inheritdoc IOccultaVault
+     * @dev Returns the controller's PENDING (un-approved) deposit to it and zeroes the pending
+     * bucket, mirroring {requestDeposit} in reverse. The claimable bucket is deliberately never
+     * read: an approved deposit already minted shares against its assets, so those assets stay
+     * productive and are not clawable here.
+     *
+     * Branchless and shortfall-safe: {_transferOut} routes through ERC-7984's optimized
+     * primitive, which is all-or-nothing (`sent == amount`, or `sent == 0` and balances
+     * untouched). The pending assets are always resident in the vault's balance — nothing removes
+     * them between {requestDeposit} and here except approval, which this path does not touch — so
+     * `sent` equals the full pending amount. The global inflight counter is decremented by `sent`,
+     * so it stays exactly equal to the sum of the surviving pending buckets. ZERO_HANDLE is
+     * handled: an empty pending bucket transfers zero and decrements the counter by zero.
+     */
+    function cancelDeposit(address controller) external override {
+        require(controller != address(0), OccultaVaultZeroAddress());
+        require(
+            isOperator(controller, msg.sender),
+            ERC7984UnauthorizedSpender(controller, msg.sender)
+        );
+
+        euint256 pending = _pendingDepositAssets[controller];
+        euint256 zero = Nox.toEuint256(0);
+        _pendingDepositAssets[controller] = zero;
+        Nox.allowThis(zero);
+
+        Nox.allowThis(pending);
+        euint256 sent = _transferOut(controller, pending);
+        Nox.allowThis(sent);
+        Nox.allow(sent, owner());
+
+        // Only what actually left the vault stops being pending; keeps the counter == Σ pending.
+        euint256 newTotalPending = Nox.sub(_totalPendingDepositAssets, sent);
+        _totalPendingDepositAssets = newTotalPending;
+        Nox.allowThis(newTotalPending);
+        Nox.allow(newTotalPending, owner());
+
+        emit DepositCancelled(controller, sent);
+    }
+
+    /**
+     * @inheritdoc IOccultaVault
+     * @dev Returns the controller's PENDING (un-approved) escrowed redeem shares from the vault
+     * back to it and zeroes the pending redeem bucket, mirroring {requestRedeem} in reverse. The
+     * shares were escrowed (moved to the vault) at request time and are burned only at
+     * {approveRedeem}, so a pending redeem's shares are still resident on the vault's balance and
+     * are returned in full. Neither the claimable redeem bucket nor {_totalClaimableRedeemAssets}
+     * is touched — those exist only for already-approved redeems.
+     */
+    function cancelRedeem(address controller) external override {
+        require(controller != address(0), OccultaVaultZeroAddress());
+        require(
+            isOperator(controller, msg.sender),
+            ERC7984UnauthorizedSpender(controller, msg.sender)
+        );
+
+        euint256 pendingShares = _pendingRedeemShares[controller];
+        euint256 zero = Nox.toEuint256(0);
+        _pendingRedeemShares[controller] = zero;
+        Nox.allowThis(zero);
+
+        Nox.allowThis(pendingShares);
+        euint256 returned = _transfer(address(this), controller, pendingShares);
+        Nox.allowThis(returned);
+        Nox.allow(returned, owner());
+        Nox.allow(returned, controller);
+
+        emit RedeemCancelled(controller, returned);
     }
 
     // ============ Views ============

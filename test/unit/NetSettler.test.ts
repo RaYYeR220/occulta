@@ -390,20 +390,31 @@ describe("NetSettler", () => {
       const carol = await submitIntent(settler, runtime, agentId, 50n * USDC, false);
       const intents = { alice, bob, carol };
 
-      // The side never appears as a plaintext anywhere in the transaction: the event carries a
-      // 32-byte handle, exactly like the size does.
+      // The event carries NO encrypted handle at all — not the size, not the side. Emitting the
+      // amount handle would let an observer match it against an address-keyed public view; the
+      // side handle is sealed for the same reason. Only plaintext metadata survives.
       const submitReceipt = await publicClient.waitForTransactionReceipt({ hash: carol.hash });
       const events = await settler.getEvents.IntentSubmitted(
         {},
         { fromBlock: submitReceipt.blockNumber, toBlock: submitReceipt.blockNumber },
       );
       assert.equal(events.length, 1);
-      assert.equal(events[0].args.isBuy, carol.side, "the event emits the side HANDLE, not a bool");
-      assert.equal(events[0].args.amount, carol.amount);
-      assert.notEqual(
-        typeof events[0].args.isBuy,
-        "boolean",
-        "no plaintext side may survive anywhere in the event",
+      assert.equal(events[0].args.agentId, agentId, "the event names the agent");
+      assert.equal(events[0].args.epoch, 0n, "the event names the epoch");
+      assert.equal(
+        (events[0].args.controller as string).toLowerCase(),
+        runtime.account.address.toLowerCase(),
+        "controller is the runtime — plaintext metadata, an accepted limit",
+      );
+      assert.equal(
+        events[0].args.amount,
+        undefined,
+        "the intent SIZE handle must never be emitted — it is a matchable fingerprint",
+      );
+      assert.equal(
+        events[0].args.isBuy,
+        undefined,
+        "the intent SIDE handle must never be emitted either",
       );
 
       for (const [who, intent] of Object.entries(intents)) {

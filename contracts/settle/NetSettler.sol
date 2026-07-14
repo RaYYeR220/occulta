@@ -265,7 +265,7 @@ contract NetSettler is INetSettler {
 
         e.intentCount += 1;
 
-        emit IntentSubmitted(agentId, epoch, msg.sender, amount, isBuy);
+        emit IntentSubmitted(agentId, epoch, msg.sender);
     }
 
     // ============ Netting and reveal ============

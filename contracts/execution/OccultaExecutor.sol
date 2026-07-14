@@ -104,6 +104,10 @@ contract OccultaExecutor is IExecutionTarget, Ownable {
     /// @notice Thrown when `sweep`'s `amount` is zero.
     error OccultaExecutorZeroAmount();
 
+    /// @notice Thrown by {renounceOwnership}: the admin role gates {sweep} over real balances,
+    /// so ownership must never be dropped to `address(0)`.
+    error RenounceDisabled();
+
     /**
      * @param aaveAdapter_ The Aave adapter this executor drives. Its ownership must be
      * transferred to this contract's address separately, after this constructor returns.
@@ -138,6 +142,16 @@ contract OccultaExecutor is IExecutionTarget, Ownable {
         weth = weth_;
         fee = fee_;
         settler = settler_;
+    }
+
+    /**
+     * @notice Renouncing ownership is permanently disabled.
+     * @dev The `Ownable` admin gates {sweep}, the only exit for a net SELL's proceeds that land
+     * on this contract; dropping the owner to `address(0)` would strand them. `transferOwnership`
+     * stays intact so the admin role can be rotated.
+     */
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /// @dev Restricts a call to the configured {settler} — the only party {NetSettler-settle}

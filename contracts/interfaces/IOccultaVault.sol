@@ -43,6 +43,13 @@ interface IOccultaVault {
     event DepositClaimed(address indexed controller, address indexed receiver, euint256 shares);
     event RedeemClaimed(address indexed controller, address indexed receiver, euint256 assets);
 
+    /// @notice Emitted when a controller's pending (un-approved) deposit is cancelled and the
+    /// assets are returned. `assets` is the encrypted amount actually returned.
+    event DepositCancelled(address indexed controller, euint256 assets);
+    /// @notice Emitted when a controller's pending (un-approved) redeem is cancelled and the
+    /// escrowed shares are returned. `shares` is the encrypted amount actually returned.
+    event RedeemCancelled(address indexed controller, euint256 shares);
+
     // ============ Metadata ============
 
     /// @notice Address of the underlying confidential asset (ERC-7984) accepted by the vault.
@@ -127,6 +134,27 @@ interface IOccultaVault {
      * assets (earmarked at `approveRedeem` time) to `receiver`.
      */
     function redeem(address receiver, address controller) external returns (euint256 assets);
+
+    // ============ Cancel Phase (EIP-7540 escape hatches) ============
+
+    /**
+     * @notice Cancels `controller`'s pending (un-approved) deposit: returns the pending assets
+     * to `controller` and zeroes the pending bucket. The depositor's escape hatch for when the
+     * agent never approves. Callable by `controller` or one of its operators.
+     * @dev Only ever touches the PENDING bucket — an already-approved (claimable) deposit is
+     * untouched, since its shares were already minted against those assets. The global inflight
+     * counter is decremented by the amount actually returned.
+     */
+    function cancelDeposit(address controller) external;
+
+    /**
+     * @notice Cancels `controller`'s pending (un-approved) redeem: returns the escrowed shares
+     * to `controller` and zeroes the pending redeem bucket. Callable by `controller` or one of
+     * its operators.
+     * @dev Only ever touches the PENDING redeem bucket — an already-approved (claimable) redeem
+     * is untouched, since its shares were already burned and its assets earmarked.
+     */
+    function cancelRedeem(address controller) external;
 
     // ============ Views ============
 

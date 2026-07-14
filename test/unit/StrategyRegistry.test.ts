@@ -3,6 +3,9 @@ import { describe, it } from "node:test";
 import { nox } from "@iexec-nox/nox-hardhat-plugin";
 
 const ZERO_HANDLE = `0x${"00".repeat(32)}` as const;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
+/** 1 USDC at the 6-decimal scale the rest of the stack nets in. */
+const USDC = 1_000_000n;
 
 /** Encrypts every value in `values` for `applicationContract`, in order. */
 async function encryptPolicy(values: bigint[], applicationContract: `0x${string}`) {
@@ -14,6 +17,26 @@ async function encryptPolicy(values: bigint[], applicationContract: `0x${string}
     proofs.push(handleProof);
   }
   return { handles, proofs };
+}
+
+type Viem = Awaited<ReturnType<typeof nox.connect>>["viem"];
+type Registry = Awaited<ReturnType<Viem["deployContract"]>>;
+
+/** Registers one agent with a sealed 4-slot policy for `runtime`; returns its agentId. The
+ *  strategist must be `viem.getWalletClients()[0]` — `nox.encryptInput` binds the input proof
+ *  to that account, and `Nox.fromExternal` requires the registrar's `msg.sender` to match. */
+async function registerAgent(
+  registry: Registry,
+  strategist: { account: { address: `0x${string}` } },
+  runtime: `0x${string}`,
+): Promise<bigint> {
+  const { handles, proofs } = await encryptPolicy([6000n, 500n, 20000n, 3000n], registry.address);
+  const agentId = (await registry.read.agentCount()) as bigint;
+  await registry.write.registerAgent(
+    ["Alpha", "Mandate", runtime, handles, proofs],
+    { account: strategist.account },
+  );
+  return agentId;
 }
 
 /** Flattens an error and its `cause` chain into one searchable string. */
@@ -189,6 +212,142 @@ describe("StrategyRegistry", () => {
           `agent-0 runtime must not be allowed on agent-1 policy slot ${i}`,
         );
       }
+    },
+  );
+
+  it("registerAgent rejects a zero runtime", { timeout: 180_000 }, async () => {
+    const { viem } = await nox.connect();
+    const [strategist] = await viem.getWalletClients();
+    const registry = await viem.deployContract("StrategyRegistry");
+
+    const { handles, proofs } = await encryptPolicy([6000n, 500n, 20000n, 3000n], registry.address);
+    await assertRevertsWithError(
+      registry.write.registerAgent(
+        ["Zero", "No runtime", ZERO_ADDRESS, handles, proofs],
+        { account: strategist.account },
+      ),
+      "ZeroRuntime",
+    );
+  });
+
+  it(
+    "only the strategist may setActive or setRuntime; setRuntime rejects the zero address",
+    { timeout: 180_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [strategist, runtime, mallory] = await viem.getWalletClients();
+      const registry = await viem.deployContract("StrategyRegistry");
+      const agentId = await registerAgent(registry, strategist, runtime.account.address);
+
+      // The registered runtime is NOT the strategist and may not touch lifecycle controls.
+      await assertRevertsWithError(
+        registry.write.setActive([agentId, false], { account: runtime.account }),
+        "NotStrategist",
+      );
+      await assertRevertsWithError(
+        registry.write.setRuntime([agentId, mallory.account.address], { account: mallory.account }),
+        "NotStrategist",
+      );
+
+      // The strategist cannot rotate the runtime to the zero address.
+      await assertRevertsWithError(
+        registry.write.setRuntime([agentId, ZERO_ADDRESS], { account: strategist.account }),
+        "ZeroRuntime",
+      );
+
+      // ...and an unknown agent has no strategist at all.
+      await assertRevertsWithError(
+        registry.write.setActive([99n, false], { account: strategist.account }),
+        "UnknownAgent",
+      );
+    },
+  );
+
+  it(
+    "setRuntime rotates the decrypt grant to the new runtime on every policy slot (additive)",
+    { timeout: 180_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      const [strategist, oldRuntime, newRuntime] = await viem.getWalletClients();
+      const registry = await viem.deployContract("StrategyRegistry");
+      const agentId = await registerAgent(registry, strategist, oldRuntime.account.address);
+
+      // Before rotation: the old runtime is the meta.runtime and is allowed on every slot.
+      for (let i = 0; i < 4; i++) {
+        assert.equal(await registry.read.isRuntimeAllowed([agentId, BigInt(i)]), true);
+      }
+
+      await registry.write.setRuntime([agentId, newRuntime.account.address], {
+        account: strategist.account,
+      });
+
+      const meta = await registry.read.metaOf([agentId]);
+      assert.equal(
+        meta.runtime.toLowerCase(),
+        newRuntime.account.address.toLowerCase(),
+        "meta.runtime must point at the new runtime after rotation",
+      );
+
+      for (let i = 0; i < 4; i++) {
+        // isRuntimeAllowed now reads against the NEW runtime — it must be true on every slot.
+        assert.equal(
+          await registry.read.isRuntimeAllowed([agentId, BigInt(i)]),
+          true,
+          `new runtime must be allowed on policy slot ${i}`,
+        );
+        const handle = await registry.read.policyOf([agentId, BigInt(i)]);
+        assert.equal(
+          await registry.read.isAllowedFor([handle, newRuntime.account.address]),
+          true,
+          `new runtime must decrypt policy slot ${i}`,
+        );
+        // Rotation is ADDITIVE by ACL-model limitation (no persistent revoke exists in Nox):
+        // the old runtime retains read access on the policy. Asserted here so the accepted
+        // limitation is documented in a passing test, not merely in a comment.
+        assert.equal(
+          await registry.read.isAllowedFor([handle, oldRuntime.account.address]),
+          true,
+          `old runtime retains policy access on slot ${i} — additive rotation`,
+        );
+      }
+    },
+  );
+
+  it(
+    "setActive(false) revokes the runtime's settler access; setActive(true) restores it",
+    { timeout: 300_000 },
+    async () => {
+      const { viem } = await nox.connect();
+      // Runtime and strategist are both account 0: encryptInput binds to it for both the
+      // policy seal (register) and the intent submission (settle path).
+      const [runtime] = await viem.getWalletClients();
+      const registry = await viem.deployContract("StrategyRegistry");
+      const executor = await viem.deployContract("MockExecutionTarget");
+      const settler = await viem.deployContract("NetSettler", [registry.address, executor.address]);
+      const agentId = await registerAgent(registry, runtime, runtime.account.address);
+
+      // A real intent lands while the agent is active.
+      const size = await nox.encryptInput(100n * USDC, "uint256", settler.address);
+      const side = await nox.encryptInput(true, "bool", settler.address);
+      await settler.write.submitIntent(
+        [agentId, size.handle, size.handleProof, side.handle, side.handleProof],
+        { account: runtime.account },
+      );
+
+      // Deactivate: the runtime's write access to the settler must vanish — this is the dead
+      // `active` check finally becoming enforceable.
+      await registry.write.setActive([agentId, false], { account: runtime.account });
+      assert.equal((await registry.read.metaOf([agentId])).active, false);
+      await assertRevertsWithError(
+        settler.write.closeEpoch([agentId], { account: runtime.account }),
+        "NetSettlerAgentInactive",
+      );
+
+      // Reactivate: access is restored and the epoch closes normally.
+      await registry.write.setActive([agentId, true], { account: runtime.account });
+      assert.equal((await registry.read.metaOf([agentId])).active, true);
+      await settler.write.closeEpoch([agentId], { account: runtime.account });
+      assert.equal(await settler.read.currentEpoch([agentId]), 1n, "closing advances the epoch");
     },
   );
 });

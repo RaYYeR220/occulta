@@ -77,6 +77,10 @@ contract UniswapAdapter is Ownable {
     /// @notice Thrown when `sweep`'s `amount` is zero.
     error UniswapAdapterZeroAmount();
 
+    /// @notice Thrown by {renounceOwnership}: this adapter holds funds mid-flight behind
+    /// `onlyOwner`, so ownership must never be dropped to `address(0)`.
+    error RenounceDisabled();
+
     /**
      * @param router_ The real Uniswap V3 SwapRouter02. Never `address(0)`.
      * @param initialOwner_ The settler/agent runtime authorized to drive this adapter.
@@ -84,6 +88,16 @@ contract UniswapAdapter is Ownable {
     constructor(ISwapRouter02 router_, address initialOwner_) Ownable(initialOwner_) {
         require(address(router_) != address(0), UniswapAdapterZeroRouter());
         router = router_;
+    }
+
+    /**
+     * @notice Renouncing ownership is permanently disabled.
+     * @dev {swapExactIn} and {sweep} are `onlyOwner`; dropping the owner to `address(0)` would
+     * freeze any balance sitting on this adapter with no recovery. `transferOwnership` stays
+     * intact so the executor can be handed control.
+     */
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /**

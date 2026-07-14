@@ -33,6 +33,13 @@ contract StrategyRegistry is IStrategyRegistry {
     /// @notice Thrown when referencing an `agentId` that was never registered.
     error UnknownAgent(uint256 agentId);
 
+    /// @notice Thrown when `registerAgent` or `setRuntime` is given the zero-address runtime —
+    /// a policy granted to `address(0)` is decryptable by nobody and irrecoverably sealed.
+    error ZeroRuntime();
+
+    /// @notice Thrown when a lifecycle setter is called by anyone but the agent's strategist.
+    error NotStrategist(uint256 agentId, address caller);
+
     struct Agent {
         AgentMeta meta;
         euint256[] policy;
@@ -46,6 +53,14 @@ contract StrategyRegistry is IStrategyRegistry {
         _;
     }
 
+    /// @dev Reverts unless `agentId` is registered AND the caller is its strategist. The
+    ///      strategist is the only party that may change an agent's lifecycle (active/runtime).
+    modifier onlyStrategist(uint256 agentId) {
+        require(agentId < _agents.length, UnknownAgent(agentId));
+        require(_agents[agentId].meta.strategist == msg.sender, NotStrategist(agentId, msg.sender));
+        _;
+    }
+
     /// @inheritdoc IStrategyRegistry
     function registerAgent(
         string calldata name,
@@ -56,6 +71,7 @@ contract StrategyRegistry is IStrategyRegistry {
     ) external returns (uint256 agentId) {
         require(policy.length > 0, EmptyPolicy());
         require(policy.length == proofs.length, LengthMismatch());
+        require(runtime != address(0), ZeroRuntime());
 
         agentId = _agents.length;
         Agent storage agent = _agents.push();
@@ -75,6 +91,32 @@ contract StrategyRegistry is IStrategyRegistry {
         }
 
         emit AgentRegistered(agentId, msg.sender, runtime, name);
+    }
+
+    /// @inheritdoc IStrategyRegistry
+    function setActive(uint256 agentId, bool active_) external onlyStrategist(agentId) {
+        _agents[agentId].meta.active = active_;
+        emit AgentActiveSet(agentId, active_);
+    }
+
+    /// @inheritdoc IStrategyRegistry
+    function setRuntime(uint256 agentId, address newRuntime) external onlyStrategist(agentId) {
+        require(newRuntime != address(0), ZeroRuntime());
+
+        Agent storage agent = _agents[agentId];
+        agent.meta.runtime = newRuntime;
+
+        // Additive grant: hand the new runtime decrypt access on every policy slot. The registry
+        // holds `allowThis` on each slot from registration, so it is entitled to extend access.
+        // No revoke of the old runtime is possible — the Nox ACL module has no persistent
+        // `disallow` (only `disallowTransient`), so the old key retains policy read access. This
+        // is an accepted ACL-model limitation, documented in {IStrategyRegistry-setRuntime}.
+        uint256 slots = agent.policy.length;
+        for (uint256 i = 0; i < slots; i++) {
+            Nox.allow(agent.policy[i], newRuntime);
+        }
+
+        emit AgentRuntimeSet(agentId, newRuntime);
     }
 
     /// @inheritdoc IStrategyRegistry
