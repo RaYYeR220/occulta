@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "hardhat test",
+    "test:fork": "hardhat test --network sepoliaFork test/integration/Aave.fork.test.ts",
     "build": "hardhat build"
   },
   "dependencies": {
