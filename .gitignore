@@ -18,6 +18,12 @@ broadcast/
 # local nox stack
 offchain-services.log
 
+# seedPool.ts output: deployments/sepolia.json (real, live addresses) is public, non-secret
+# blockchain data and is committed intentionally. Fork-run output is not a real deployment —
+# each `--network sepoliaFork` run forks live state fresh and discards it on exit, so a pool
+# address written there is only meaningful for the run that produced it. Never commit it.
+deployments/*Fork.json
+
 # editor / os
 .DS_Store
 .idea/
