@@ -14,9 +14,8 @@ import { formatEther, formatUnits, parseAbi, zeroAddress, type Address, type Has
  * deliberately meant to compose over the SAME assets, so this script creates and seeds a real
  * Aave-USDC/Aave-WETH pool itself via the real NonfungiblePositionManager — genuine Uniswap V3
  * code, genuine tokens, genuine self-provisioned liquidity that cannot be pulled out from under
- * the demo. This is the productionised form of what test/integration/Uniswap.fork.test.ts already
- * does inline; the token/fee/tick constants and the sqrtPriceX96 derivation below are reused
- * verbatim from that test.
+ * the demo. The token/fee/tick-spacing constants and the sqrtPriceX96 derivation below are reused
+ * verbatim from test/integration/Uniswap.fork.test.ts (Task 8).
  *
  * Fee tier: 10000 (1%), NOT the usual 3000. A direct on-chain query of the real
  * UniswapV3Factory.getPool(USDC, WETH, fee) on live Sepolia found the 3000-fee pool for this
@@ -49,15 +48,26 @@ import { formatEther, formatUnits, parseAbi, zeroAddress, type Address, type Has
  * gas-only, and every code path that touches it says so loudly (console output, the pre-flight
  * balance check, and the deployment artifact's `wethSource` field).
  *
- * Position size: a modest ~2 WETH + 6,000 USDC (previously 10 WETH + 20,000 USDC) — this pool
- * only needs to be deep enough for the demo's own swaps to land at a sane price with acceptable
- * slippage, not deeply liquid, and a smaller target keeps any live `deposit()` fallback as cheap
- * as it can possibly be. 6,000 / 2 = 3,000 USDC per WETH, exactly the target price below, so the
- * mint is NOT lopsided — both sides are fully consumed, unlike a mismatched ratio that would
- * silently leave one side over-supplied and shift the pool off its intended price.
+ * Position: a CONCENTRATED range, not full-range. Full-range Uniswap V3 liquidity is extremely
+ * capital-inefficient — the previous version of this script needed ~2 real WETH to seed a
+ * full-range position, and real Sepolia ETH is this project's scarce resource (the deployer's
+ * live balance is ~0.06 ETH). Occulta's demo only ever executes small aggregate net orders (a few
+ * to ~20 USDC per epoch); the pool only has to price THOSE swaps well. Concentrating the position
+ * into a tight band around the initialized price (see TICK_LOWER/TICK_UPPER below — roughly
+ * -11%/+9% around 3,000 USDC/WETH, tick-spacing-aligned) gives deep effective liquidity for
+ * small swaps out of a tiny fraction of the capital: ~0.03 WETH (well under 0.05 real ETH once
+ * gas is added) plus its correctly-paired USDC amount (USDC is free from the faucet, so that side
+ * is sized with deliberate headroom — see the paired-amount derivation below). A dedicated
+ * post-seed check (`checkDemoSwapPriceImpact`) then proves this isn't just a smaller pool but a
+ * genuinely USABLE one: it quotes a real $10 swap in both directions via QuoterV2 and asserts the
+ * price impact — which, at fee tier 10000, is mostly the pool's own 1% swap fee plus a thin
+ * slippage margin on top — stays under 2%, aborting loudly otherwise. The band is deliberately
+ * narrow (near the tight end of the brief's ±10-25% guidance) precisely so that thin slippage
+ * margin stays comfortably below the 2% ceiling instead of hugging it.
  *
  * Safe to re-run: this script checks on-chain state before writing anything (createPool/mint) and
- * exits without spending gas if a correctly-priced pool already exists — see step 2 below.
+ * exits without spending gas if a correctly-priced, correctly-priced-for-the-demo pool already
+ * exists — see step 2 below.
  *
  * Usage:
  *   pnpm seed:fork     -> hardhat run scripts/seedPool.ts --network sepoliaFork (EDR fork, verification)
@@ -79,16 +89,12 @@ const USDC_DECIMALS = 6;
 const WETH_DECIMALS = 18;
 
 const FEE_TIER = 10000; // 1% — see the fee-tier note above.
+const TICK_SPACING = 200; // factory.feeAmountTickSpacing(10000) == 200, confirmed on-chain (see header).
 
 /** Faucet is capped at 10,000 units/call (scaled by decimals); the loop below reaches the target
  * instead of assuming a single call suffices, though at this script's position size both tokens'
  * targets fit comfortably inside one call each. */
 const faucetCapFor = (decimals: number): bigint => 10_000n * 10n ** BigInt(decimals);
-
-/** Target liquidity offered to the position — a modest, demo-sized depth, not deep liquidity. See
- * the "Position size" note above for why these two numbers are chosen together. */
-const USDC_SEED_TARGET = 6_000n * 10n ** BigInt(USDC_DECIMALS); // 6,000 USDC
-const WETH_SEED_TARGET = 2n * 10n ** BigInt(WETH_DECIMALS); // 2 WETH
 
 /**
  * `sqrtPriceX96` derivation for token0 = Aave-USDC (6 decimals), token1 = Aave-WETH (18
@@ -134,30 +140,113 @@ const priceNumerator = 10n ** BigInt(WETH_DECIMALS); // 1 WETH, raw
 const priceDenominator = TARGET_USDC_PER_WETH * 10n ** BigInt(USDC_DECIMALS); // 3,000 USDC, raw
 const SQRT_PRICE_X96_USDC_WETH = isqrt((priceNumerator * Q192) / priceDenominator);
 
-/** Wide, effectively full-range position for the 1% tier's tick spacing (200): the nearest
- * usable ticks to Uniswap's global MIN_TICK/MAX_TICK (-887272 / 887272) that are multiples of
- * 200 without exceeding that range (-887272 / 200 = -4436.36, so -4436 * 200 = -887200; mirrored
- * for the upper bound). Reused verbatim from the Task 8 fork test. */
-const TICK_LOWER = -887200;
-const TICK_UPPER = 887200;
+/**
+ * Concentrated tick range + paired deposit amounts. This is the actual fix: a tight band around
+ * the initialized price instead of Uniswap's global min/max ticks.
+ *
+ * `price_raw(tick) = 1.0001^tick` is the same token1_raw/token0_raw ratio
+ * `SQRT_PRICE_X96_USDC_WETH` is built from above, just not yet square-rooted or Q96-scaled.
+ * Unlike that constant (which sets the pool's actual on-chain price and therefore MUST be exact
+ * BigInt math), the helpers below use ordinary floating point: they only choose which nearby
+ * tick-spacing-aligned boundary to mint into and how much of each token to offer as an off-chain
+ * ESTIMATE. The on-chain `mint()` call itself performs the exact fixed-point reconciliation and
+ * refunds whichever side isn't the binding constraint, so float error here (a few parts in
+ * 10^15) affects neither the pool's price nor correctness — only how tightly the (deliberately
+ * generous, see below) USDC estimate matches the exact requirement.
+ */
+const rawPriceAtTick = (tick: number): number => Math.pow(1.0001, tick);
+const sqrtRawAtTick = (tick: number): number => Math.sqrt(rawPriceAtTick(tick));
+
+/** Inverse of `rawPriceAtTick` for a human "USDC per 1 WETH" price: solves `1.0001^tick ==
+ * priceRaw` for tick, where priceRaw is derived exactly the way `SQRT_PRICE_X96_USDC_WETH`'s own
+ * comment derives it (`priceRaw = humanPrice(token0 in token1) * 10^(decimals1-decimals0)`). */
+const tickForUsdcPerWeth = (usdcPerWeth: number): number => {
+  const priceRaw = (1 / usdcPerWeth) * 10 ** (WETH_DECIMALS - USDC_DECIMALS);
+  return Math.log(priceRaw) / Math.log(1.0001);
+};
+
+const alignTick = (tick: number): number => Math.round(tick / TICK_SPACING) * TICK_SPACING;
+
+/** Band: roughly 2,700 - 3,300 USDC/WETH (-10% / +10% of the 3,000 target), tick-aligned to
+ * spacing 200 — near the tight end of the brief's requested ±10-25% guidance, chosen deliberately
+ * narrow so the demo-size price-impact check below has real margin under its 2% ceiling instead
+ * of hugging it (a wider ±20% band was tried first and measured ~1.95% total impact on a real
+ * fork run — technically passing but too close to the edge to trust; see the Task 9 report).
+ * Because tick(price) is a log scale, aligning to the nearest multiple of 200 moves each bound
+ * slightly: the actual minted range ends up ~2,676 - ~3,268 USDC/WETH (-10.8% / +8.9% of the
+ * target).
+ * TICK_LOWER corresponds to the HIGHER USDC/WETH bound (3,300 — WETH more expensive, smaller raw
+ * price ratio, smaller tick) and TICK_UPPER to the LOWER bound (2,700 — WETH cheaper, larger raw
+ * price ratio, larger tick) — the same inverse relationship the sqrtPriceX96 derivation above
+ * notes for the pool's own price. */
+const BAND_LOWER_USDC_PER_WETH = 2_700;
+const BAND_UPPER_USDC_PER_WETH = 3_300;
+const TICK_LOWER = alignTick(tickForUsdcPerWeth(BAND_UPPER_USDC_PER_WETH));
+const TICK_UPPER = alignTick(tickForUsdcPerWeth(BAND_LOWER_USDC_PER_WETH));
+
+/** WETH is the scarce, real-ETH-backed side, so it is fixed first: 0.03 WETH, deliberately at the
+ * low end of the brief's 0.03-0.05 suggested range so that WETH + gas stays well under the 0.05
+ * ETH budget even at an elevated gas price (see ESTIMATED_GAS_UNITS below). */
+const WETH_SEED_TARGET = (3n * 10n ** BigInt(WETH_DECIMALS)) / 100n; // 0.03 WETH
+
+/** USDC is derived from WETH_SEED_TARGET and the tick range above using the standard Uniswap V3
+ * in-range liquidity formulas — NOT a guessed or flat-ratio number, and NOT the naive "3,000x the
+ * WETH amount" full-range shortcut (which would badly overshoot here, since a concentrated
+ * position needs far less of the paired side per unit of the fixed side than a full-range one
+ * does):
+ *
+ *   amount0 = L * (1/sqrtP - 1/sqrtPb)   (token0 = USDC)
+ *   amount1 = L * (sqrtP - sqrtPa)       (token1 = WETH)
+ *
+ * Fixing amount1 = WETH_SEED_TARGET gives L = amount1 / (sqrtP - sqrtPa), and substituting back:
+ *
+ *   amount0 = amount1 * (1/sqrtP - 1/sqrtPb) / (sqrtP - sqrtPa)
+ *
+ * A 15% buffer is then added on top of that exact match. USDC is free from the faucet, so a
+ * generous offer costs nothing, and it guarantees — by construction, not by luck of rounding —
+ * that WETH (the side actually backed by real ETH) is always the binding constraint at mint time;
+ * any USDC above the exact match simply never leaves the deployer's balance (mint() only pulls
+ * what the fixed WETH side needs and leaves the rest). A lopsided guess in the other direction
+ * would do the opposite: silently make USDC the binding constraint and strand real, already-
+ * wrapped WETH un-deposited.
+ */
+const sqrtP0Raw = Math.sqrt(Number(priceNumerator) / Number(priceDenominator));
+const sqrtPaRaw = sqrtRawAtTick(TICK_LOWER);
+const sqrtPbRaw = sqrtRawAtTick(TICK_UPPER);
+const USDC_PER_WETH_RAW_RATIO = (1 / sqrtP0Raw - 1 / sqrtPbRaw) / (sqrtP0Raw - sqrtPaRaw);
+const USDC_HEADROOM_MULTIPLIER = 1.15;
+const USDC_SEED_TARGET = BigInt(Math.ceil(Number(WETH_SEED_TARGET) * USDC_PER_WETH_RAW_RATIO * USDC_HEADROOM_MULTIPLIER));
 
 /** Sane band for the post-seed / idempotency-check quote, centered on the 3,000 USDC/WETH target
  * price and wide enough to absorb this pool's own price impact and any real trading that has
  * happened against it since — while still catching a wrong-order-of-magnitude sqrtPriceX96 (the
  * live 3000-fee pool for this pair is mispriced by ~800x, so even a generous band like this one
  * catches that class of failure easily). Expressed as "per 1 WETH" / "per 1,000 USDC" regardless
- * of how large the actual test trade below is — see checkQuotesSane for the scaling. */
+ * of how large the actual test trade below is — see checkQuotesSane for the scaling. Deliberately
+ * broader than the concentrated position's own ~2,676-3,268 range: this check exists to catch
+ * gross mispricing (wrong order of magnitude), not to duplicate the tighter, demo-specific price-
+ * impact assertion below. */
 const MIN_USDC_PER_ONE_WETH = 2_000n * 10n ** BigInt(USDC_DECIMALS);
 const MAX_USDC_PER_ONE_WETH = 4_000n * 10n ** BigInt(USDC_DECIMALS);
 const MIN_WETH_PER_1000_USDC = (250n * 10n ** BigInt(WETH_DECIMALS)) / 1000n; // 0.25 WETH
 const MAX_WETH_PER_1000_USDC = (500n * 10n ** BigInt(WETH_DECIMALS)) / 1000n; // 0.50 WETH
 
+/** Demo-representative swap size: Occulta's aggregate net orders run a few to ~20 USDC per epoch
+ * — this checks the pool actually prices a realistic ~$10 swap well, not just that it exists.
+ * DEMO_SWAP_WETH is the same ~$10 expressed in WETH at the target price, computed from the exact
+ * priceNumerator/priceDenominator ratio above (not a separate guess) so both directions test the
+ * same dollar amount. MAX_PRICE_IMPACT_BPS is the brief's ~2% execution-quality target. */
+const DEMO_SWAP_USDC = 10n * 10n ** BigInt(USDC_DECIMALS); // 10 USDC
+const DEMO_SWAP_WETH = (DEMO_SWAP_USDC * priceNumerator) / priceDenominator; // ~10 USDC of WETH
+const MAX_PRICE_IMPACT_BPS = 200n; // 2%
+
 /** Gas budget for a full seeding run: faucet mint(s) and/or a deposit() fallback for WETH, one
  * faucet mint for USDC, two approvals, createAndInitializePoolIfNecessary (deploys a full pool
- * contract — by far the largest single cost here), and the position mint. An actual `sepoliaFork`
- * run of this exact script summed ~1.84M gas units across all six transactions (see the Task 9
- * report for the receipts); this budget keeps roughly 35% margin over that observed total for
- * live gas-usage variance. */
+ * contract — by far the largest single cost here), and the position mint. Unchanged from the
+ * previous (full-range) version of this script: the transaction shape is identical, only the
+ * amounts differ, and gas cost is not amount-sensitive. See the Task 9 report for the underlying
+ * fork receipts this budget is calibrated against.
+ */
 const ESTIMATED_GAS_UNITS = 2_500_000n;
 
 const erc20Abi = parseAbi([
@@ -193,6 +282,13 @@ interface Quotes {
   usdcToWeth: bigint;
 }
 
+interface DemoSwapImpact {
+  usdcToWethOut: bigint;
+  usdcToWethImpactBps: bigint;
+  wethToUsdcOut: bigint;
+  wethToUsdcImpactBps: bigint;
+}
+
 async function main() {
   // token0/token1 sort sanity: the whole sqrtPriceX96 derivation above assumes USDC < WETH by
   // address. If this ever stopped holding (it can't, both are fixed constants, but the check is
@@ -200,6 +296,15 @@ async function main() {
   // be for the wrong pair orientation.
   if (!(BigInt(USDC) < BigInt(WETH))) {
     throw new Error("expected USDC to sort as token0 — sqrtPriceX96 derivation assumes this order");
+  }
+  // Tick-range sanity: the concentrated band must actually straddle the initialized price and
+  // land on valid, spacing-aligned ticks — cheap to check, and a silent failure here would mean
+  // minting a position that can never hold any liquidity at the initialized price.
+  if (!(TICK_LOWER % TICK_SPACING === 0 && TICK_UPPER % TICK_SPACING === 0)) {
+    throw new Error(`tick range not aligned to spacing ${TICK_SPACING}: [${TICK_LOWER}, ${TICK_UPPER}]`);
+  }
+  if (!(TICK_LOWER < TICK_UPPER)) {
+    throw new Error(`invalid tick range: TICK_LOWER (${TICK_LOWER}) must be below TICK_UPPER (${TICK_UPPER})`);
   }
 
   const connection = await network.create();
@@ -305,9 +410,89 @@ async function main() {
     return { wethToUsdc, usdcToWeth };
   };
 
+  // The point of the whole exercise: prove the concentrated position is genuinely usable for the
+  // demo, not just non-empty. Quotes a realistic ~$10 swap in both directions via QuoterV2's
+  // staticCall (simulateContract) and asserts the price impact against the pool's INITIALIZED
+  // price (not its possibly-since-moved spot price) stays under MAX_PRICE_IMPACT_BPS. Aborts
+  // loudly — does not attempt to "fix" a pool that fails this.
+  const checkDemoSwapPriceImpact = async (context: string): Promise<DemoSwapImpact> => {
+    const expectedWethOut = (DEMO_SWAP_USDC * priceNumerator) / priceDenominator;
+    const expectedUsdcOut = (DEMO_SWAP_WETH * priceDenominator) / priceNumerator;
+
+    const quoteAndCheck = async (
+      label: string,
+      tokenIn: Address,
+      tokenOut: Address,
+      amountIn: bigint,
+      amountInDecimals: number,
+      expectedOut: bigint,
+      outDecimals: number,
+    ): Promise<{ amountOut: bigint; impactBps: bigint }> => {
+      let amountOut: bigint;
+      try {
+        const quote = await publicClient.simulateContract({
+          address: QUOTER_V2,
+          abi: quoterAbi,
+          functionName: "quoteExactInputSingle",
+          args: [{ tokenIn, tokenOut, amountIn, fee: FEE_TIER, sqrtPriceLimitX96: 0n }],
+          account: deployer.account,
+        });
+        [amountOut] = quote.result;
+      } catch (err) {
+        throw new Error(
+          `${context}: demo-size ${label} quote failed — the pool cannot price a realistic demo swap at ` +
+            `all. Aborting; not attempting to fix a broken pool. Underlying error: ${String(err)}`,
+        );
+      }
+      const diff = amountOut > expectedOut ? amountOut - expectedOut : expectedOut - amountOut;
+      const impactBps = (diff * 10_000n) / expectedOut;
+      console.log(
+        `  ${label}: ${formatUnits(amountIn, amountInDecimals)} in -> ${formatUnits(amountOut, outDecimals)} out ` +
+          `(expected ${formatUnits(expectedOut, outDecimals)} at the initialized price) -> ` +
+          `price impact ${Number(impactBps) / 100}%`,
+      );
+      if (impactBps >= MAX_PRICE_IMPACT_BPS) {
+        throw new Error(
+          `${context}: demo-size ${label} price impact is ${Number(impactBps) / 100}%, at/above the ` +
+            `${Number(MAX_PRICE_IMPACT_BPS) / 100}% target. Aborting — this pool is not genuinely usable ` +
+            `for the demo at its current concentration/size, not just non-empty.`,
+        );
+      }
+      return { amountOut, impactBps };
+    };
+
+    console.log(`\n${context}: demo-size swap price-impact check (~$10-equivalent, both directions)`);
+    const usdcToWeth = await quoteAndCheck(
+      "USDC -> WETH",
+      USDC,
+      WETH,
+      DEMO_SWAP_USDC,
+      USDC_DECIMALS,
+      expectedWethOut,
+      WETH_DECIMALS,
+    );
+    const wethToUsdc = await quoteAndCheck(
+      "WETH -> USDC",
+      WETH,
+      USDC,
+      DEMO_SWAP_WETH,
+      WETH_DECIMALS,
+      expectedUsdcOut,
+      USDC_DECIMALS,
+    );
+
+    return {
+      usdcToWethOut: usdcToWeth.amountOut,
+      usdcToWethImpactBps: usdcToWeth.impactBps,
+      wethToUsdcOut: wethToUsdc.amountOut,
+      wethToUsdcImpactBps: wethToUsdc.impactBps,
+    };
+  };
+
   const writeArtifact = async (args: {
     poolAddress: Address;
     quotes: Quotes;
+    demoSwapImpact: DemoSwapImpact;
     createdThisRun: boolean;
     txHashes: Record<string, Hash>;
     amountsDeposited?: { usdc: bigint; weth: bigint };
@@ -345,6 +530,16 @@ async function main() {
         oneWethInUsdc: args.quotes.wethToUsdc.toString(),
         oneThousandUsdcInWeth: args.quotes.usdcToWeth.toString(),
       },
+      // Proof the concentrated position is actually usable for the demo — see
+      // checkDemoSwapPriceImpact. bps values are basis points (100 = 1%).
+      demoSwapPriceImpact: {
+        usdcIn: DEMO_SWAP_USDC.toString(),
+        usdcToWethOut: args.demoSwapImpact.usdcToWethOut.toString(),
+        usdcToWethImpactBps: args.demoSwapImpact.usdcToWethImpactBps.toString(),
+        wethIn: DEMO_SWAP_WETH.toString(),
+        wethToUsdcOut: args.demoSwapImpact.wethToUsdcOut.toString(),
+        wethToUsdcImpactBps: args.demoSwapImpact.wethToUsdcImpactBps.toString(),
+      },
       createdThisRun: args.createdThisRun,
       amountsDeposited: args.amountsDeposited
         ? { usdc: args.amountsDeposited.usdc.toString(), weth: args.amountsDeposited.weth.toString() }
@@ -361,7 +556,7 @@ async function main() {
   };
 
   // 2. Idempotency: check the real factory before touching anything else. A pool that already
-  // exists at a sane price costs this run zero gas.
+  // exists at a sane, demo-usable price costs this run zero gas.
   const existingPool = (await publicClient.readContract({
     address: FACTORY,
     abi: factoryAbi,
@@ -374,9 +569,11 @@ async function main() {
     const quotes = await checkQuotesSane(`pool at ${existingPool}`);
     console.log(
       `pool already seeded, price sane: 1 WETH ~= ${formatUnits(quotes.wethToUsdc, USDC_DECIMALS)} USDC, ` +
-        `1,000 USDC ~= ${formatUnits(quotes.usdcToWeth, WETH_DECIMALS)} WETH. Exiting without spending gas.`,
+        `1,000 USDC ~= ${formatUnits(quotes.usdcToWeth, WETH_DECIMALS)} WETH.`,
     );
-    await writeArtifact({ poolAddress: existingPool, quotes, createdThisRun: false, txHashes: {} });
+    const demoSwapImpact = await checkDemoSwapPriceImpact(`pool at ${existingPool}`);
+    console.log(`demo-size price impact check passed. Exiting without spending gas.`);
+    await writeArtifact({ poolAddress: existingPool, quotes, demoSwapImpact, createdThisRun: false, txHashes: {} });
     return;
   }
 
@@ -420,6 +617,10 @@ async function main() {
   );
 
   const ethNeeded = wethDepositNeeded + estimatedGasCost;
+  console.log(
+    `total real ETH needed for this run: ~${formatEther(ethNeeded)} ETH ` +
+      `(${formatEther(wethDepositNeeded)} ETH to wrap into WETH + ~${formatEther(estimatedGasCost)} ETH gas)`,
+  );
   if (ethBalance < ethNeeded) {
     throw new Error(
       wethDepositNeeded > 0n
@@ -492,8 +693,8 @@ async function main() {
   }
   console.log(`deployer WETH balance now: ${formatUnits(wethBalance, WETH_DECIMALS)} (source: ${wethSource})`);
 
-  // 4/5. Approve both tokens to the position manager, then create+initialize the pool and mint a
-  // wide-range position.
+  // 4/5. Approve both tokens to the position manager, then create+initialize the pool and mint the
+  // concentrated position.
   txHashes.approveUsdc = await writeAndWait(`approve ${formatUnits(USDC_SEED_TARGET, USDC_DECIMALS)} USDC to position manager`, () =>
     deployer.writeContract({
       address: USDC,
@@ -529,7 +730,7 @@ async function main() {
   const wethBeforeMintCall = await readBalance(WETH, deployer.account.address);
 
   txHashes.mintPosition = await writeAndWait(
-    `mint wide-range position (ticks ${TICK_LOWER}..${TICK_UPPER})`,
+    `mint concentrated position (ticks ${TICK_LOWER}..${TICK_UPPER})`,
     () =>
       deployer.writeContract({
         address: POSITION_MANAGER,
@@ -560,8 +761,9 @@ async function main() {
     weth: wethBeforeMintCall - wethAfterMintCall,
   };
 
-  // 6. Verify: the pool now exists, and both quote directions land in a sane band around the
-  // target price. Abort loudly (throw) rather than leave a mispriced pool behind.
+  // 6. Verify: the pool now exists, both quote directions land in a sane band around the target
+  // price, AND a realistic demo-size swap prices well in both directions. Abort loudly (throw)
+  // rather than leave a mispriced or unusable pool behind.
   const poolAddress = (await publicClient.readContract({
     address: FACTORY,
     abi: factoryAbi,
@@ -573,12 +775,13 @@ async function main() {
   }
 
   const quotes = await checkQuotesSane(`freshly seeded pool at ${poolAddress}`);
+  const demoSwapImpact = await checkDemoSwapPriceImpact(`freshly seeded pool at ${poolAddress}`);
 
   // 7. Summary.
   console.log(`\n== seeding complete ==`);
   console.log(`pool address:       ${poolAddress}`);
   console.log(`fee tier:           ${FEE_TIER}`);
-  console.log(`tick range:         ${TICK_LOWER} .. ${TICK_UPPER}`);
+  console.log(`tick range:         ${TICK_LOWER} .. ${TICK_UPPER} (concentrated, ~-11%/+9% band)`);
   console.log(`USDC deposited:     ${formatUnits(amountsDeposited.usdc, USDC_DECIMALS)}`);
   console.log(`WETH deposited:     ${formatUnits(amountsDeposited.weth, WETH_DECIMALS)} (source: ${wethSource})`);
   console.log(
@@ -588,12 +791,20 @@ async function main() {
   );
   console.log(`quote 1 WETH ->     ${formatUnits(quotes.wethToUsdc, USDC_DECIMALS)} USDC`);
   console.log(`quote 1,000 USDC -> ${formatUnits(quotes.usdcToWeth, WETH_DECIMALS)} WETH`);
+  console.log(
+    `demo swap 10 USDC ->     ${formatUnits(demoSwapImpact.usdcToWethOut, WETH_DECIMALS)} WETH ` +
+      `(impact ${Number(demoSwapImpact.usdcToWethImpactBps) / 100}%)`,
+  );
+  console.log(
+    `demo swap ${formatUnits(DEMO_SWAP_WETH, WETH_DECIMALS)} WETH -> ${formatUnits(demoSwapImpact.wethToUsdcOut, USDC_DECIMALS)} USDC ` +
+      `(impact ${Number(demoSwapImpact.wethToUsdcImpactBps) / 100}%)`,
+  );
   console.log(`transactions:`);
   for (const [label, hash] of Object.entries(txHashes)) {
     console.log(`  ${label}: ${hash}`);
   }
 
-  await writeArtifact({ poolAddress, quotes, createdThisRun: true, txHashes, amountsDeposited, wethSource });
+  await writeArtifact({ poolAddress, quotes, demoSwapImpact, createdThisRun: true, txHashes, amountsDeposited, wethSource });
 }
 
 main().catch((err) => {
