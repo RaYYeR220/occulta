@@ -7,7 +7,9 @@
     "test:fork": "hardhat test --network sepoliaFork test/integration/Aave.fork.test.ts test/integration/Uniswap.fork.test.ts test/integration/Executor.fork.test.ts",
     "build": "hardhat build",
     "seed:sepolia": "hardhat run scripts/seedPool.ts --network sepolia",
-    "seed:fork": "hardhat run scripts/seedPool.ts --network sepoliaFork"
+    "seed:fork": "hardhat run scripts/seedPool.ts --network sepoliaFork",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
+    "deploy:fork": "hardhat run scripts/deploy.ts --network sepoliaFork"
   },
   "dependencies": {
     "@iexec-nox/nox-confidential-contracts": "^0.2.0",

@@ -289,7 +289,36 @@ interface DemoSwapImpact {
   wethToUsdcImpactBps: bigint;
 }
 
-async function main() {
+export interface SeedPoolResult {
+  poolAddress: Address;
+  quotes: Quotes;
+  demoSwapImpact: DemoSwapImpact;
+  createdThisRun: boolean;
+  txHashes: Record<string, Hash>;
+  amountsDeposited?: { usdc: bigint; weth: bigint };
+  wethSource?: "faucet" | "deposit-fallback";
+}
+
+/**
+ * Core seeding logic, factored out so other scripts (Task 10b's scripts/deploy.ts) can reuse it
+ * against an ALREADY-CREATED network connection, rather than standing up a second, independent
+ * one. This matters specifically on an EDR fork: a second `network.create()` call forks live
+ * Sepolia state fresh, into its own separate in-memory chain that never sees whatever the caller
+ * already deployed on its own connection — so the pool this function seeds would be invisible to
+ * a caller's already-deployed adapters/executor if it created its own connection instead of
+ * reusing the caller's.
+ *
+ * `writeArtifactFile` defaults to `true` so the standalone `pnpm seed:fork` / `pnpm seed:sepolia`
+ * entrypoint below (`main`) is completely unchanged. A caller maintaining its own, richer
+ * deployment artifact (Task 10b's deploy script) passes `false` and folds this function's return
+ * value into its own file instead.
+ */
+export async function seedPool(
+  connection: Awaited<ReturnType<typeof network.create>>,
+  options: { writeArtifactFile?: boolean } = {},
+): Promise<SeedPoolResult> {
+  const writeArtifactFile = options.writeArtifactFile ?? true;
+
   // token0/token1 sort sanity: the whole sqrtPriceX96 derivation above assumes USDC < WETH by
   // address. If this ever stopped holding (it can't, both are fixed constants, but the check is
   // free and matches the fork test's own defensive assertion) the derived price would silently
@@ -307,7 +336,6 @@ async function main() {
     throw new Error(`invalid tick range: TICK_LOWER (${TICK_LOWER}) must be below TICK_UPPER (${TICK_UPPER})`);
   }
 
-  const connection = await network.create();
   const { viem, networkName } = connection;
   const [deployer] = await viem.getWalletClients();
   const publicClient = await viem.getPublicClient();
@@ -489,15 +517,7 @@ async function main() {
     };
   };
 
-  const writeArtifact = async (args: {
-    poolAddress: Address;
-    quotes: Quotes;
-    demoSwapImpact: DemoSwapImpact;
-    createdThisRun: boolean;
-    txHashes: Record<string, Hash>;
-    amountsDeposited?: { usdc: bigint; weth: bigint };
-    wethSource?: "faucet" | "deposit-fallback";
-  }) => {
+  const writeArtifact = async (args: SeedPoolResult) => {
     const scriptDir = path.dirname(fileURLToPath(import.meta.url));
     const outDir = path.join(scriptDir, "..", "deployments");
     await mkdir(outDir, { recursive: true });
@@ -573,8 +593,15 @@ async function main() {
     );
     const demoSwapImpact = await checkDemoSwapPriceImpact(`pool at ${existingPool}`);
     console.log(`demo-size price impact check passed. Exiting without spending gas.`);
-    await writeArtifact({ poolAddress: existingPool, quotes, demoSwapImpact, createdThisRun: false, txHashes: {} });
-    return;
+    const result: SeedPoolResult = {
+      poolAddress: existingPool,
+      quotes,
+      demoSwapImpact,
+      createdThisRun: false,
+      txHashes: {},
+    };
+    if (writeArtifactFile) await writeArtifact(result);
+    return result;
   }
 
   console.log(`\nno pool yet at fee=${FEE_TIER} for this pair — seeding it now.`);
@@ -804,11 +831,51 @@ async function main() {
     console.log(`  ${label}: ${hash}`);
   }
 
-  await writeArtifact({ poolAddress, quotes, demoSwapImpact, createdThisRun: true, txHashes, amountsDeposited, wethSource });
+  const result: SeedPoolResult = {
+    poolAddress,
+    quotes,
+    demoSwapImpact,
+    createdThisRun: true,
+    txHashes,
+    amountsDeposited,
+    wethSource,
+  };
+  if (writeArtifactFile) await writeArtifact(result);
+  return result;
 }
 
-main().catch((err) => {
-  console.error("\nseedPool.ts failed:");
-  console.error(err instanceof Error ? err.message : err);
-  process.exitCode = 1;
+async function main() {
+  const connection = await network.create();
+  await seedPool(connection);
+}
+
+/**
+ * Guards the standalone-CLI invocation below so it fires ONLY when `hardhat run` was pointed at
+ * THIS file directly (`pnpm seed:fork` / `pnpm seed:sepolia`) — never as a side effect of another
+ * script `import`ing {seedPool} (Task 10b's scripts/deploy.ts does exactly that). Without this
+ * guard, importing this module would unconditionally run its own `network.create()` + full pool
+ * seed as an uncontrolled side effect: on an EDR fork that means a SECOND, entirely independent
+ * forked chain that the importing script's own connection and deployed contracts never see —
+ * silently wasted gas and, worse, console output interleaved with the importer's own.
+ *
+ * Hardhat's `run` task does not put the script path at `process.argv[1]` (that slot is
+ * hardhat's own CLI entry point), so the usual `import.meta.url === process.argv[1]` entrypoint
+ * check does not apply here. Scanning the full `argv` for an entry that resolves to this file's
+ * own path is robust to where in the invocation Hardhat's script argument lands.
+ */
+const scriptPath = fileURLToPath(import.meta.url);
+const isDirectInvocation = process.argv.some((arg) => {
+  try {
+    return path.resolve(arg) === scriptPath;
+  } catch {
+    return false;
+  }
 });
+
+if (isDirectInvocation) {
+  main().catch((err) => {
+    console.error("\nseedPool.ts failed:");
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  });
+}
