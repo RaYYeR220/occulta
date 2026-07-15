@@ -37,8 +37,8 @@ port and nothing to "start" on its own; an MCP client spawns it as a subprocess.
 
 ## Add it to an MCP client
 
-Any client that speaks MCP over stdio (Claude Desktop, Claude Code, or a custom agent harness)
-can run this server with a snippet like:
+Any MCP-compatible client that speaks the protocol over stdio (Cursor, Windsurf, or a custom agent
+harness) can run this server with a snippet like:
 
 ```json
 {
@@ -54,8 +54,8 @@ can run this server with a snippet like:
 }
 ```
 
-Drop that under the `mcpServers` key of `claude_desktop_config.json` (or your client's equivalent
-`mcp.json`), swap in the absolute path to this repo's `dist/index.js`, and restart the client.
+Drop that under the `mcpServers` key of your client's MCP config (usually `mcp.json`), swap in the
+absolute path to this repo's `dist/index.js`, and restart the client.
 `SEPOLIA_RPC_URL` is optional — omit it and the server falls back to a public Sepolia RPC.
 
 ## Configuration
