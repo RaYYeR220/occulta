@@ -249,10 +249,23 @@ const MAX_PRICE_IMPACT_BPS = 200n; // 2%
  */
 const ESTIMATED_GAS_UNITS = 2_500_000n;
 
+/** Gas budget for the "pool already exists but is EMPTY" resume path (see the idempotency check
+ * below): no faucet mints, no deposit() wrap, and createAndInitializePoolIfNecessary is a no-op
+ * against an already-initialized pool — only the two approvals plus the mint itself. Kept
+ * separate from ESTIMATED_GAS_UNITS (calibrated for a full fresh run) so the pre-flight ETH
+ * balance check does not over-demand ETH the deployer no longer needs to spend. */
+const ESTIMATED_GAS_UNITS_RESUME = 900_000n;
+
 const erc20Abi = parseAbi([
   "function balanceOf(address account) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
 ]);
+
+/** Minimal read-only slice of IUniswapV3PoolState — just enough to distinguish "pool exists and
+ * is genuinely seeded" from "pool exists but a previous mint never completed" (liquidity == 0).
+ * QuoterV2 against the latter reverts or returns garbage, so this check MUST happen before any
+ * quote is attempted — see the idempotency check below. */
+const poolStateAbi = parseAbi(["function liquidity() view returns (uint128)"]);
 
 const faucetAbi = parseAbi([
   "function mint(address token, address to, uint256 amount) returns (uint256)",
@@ -576,7 +589,14 @@ export async function seedPool(
   };
 
   // 2. Idempotency: check the real factory before touching anything else. A pool that already
-  // exists at a sane, demo-usable price costs this run zero gas.
+  // exists AND already carries liquidity, at a sane, demo-usable price, costs this run zero gas.
+  //
+  // A pool can also exist with ZERO liquidity — createAndInitializePoolIfNecessary succeeded (it
+  // is idempotent) but a subsequent mint() never completed (reverted, or was never sent at all).
+  // QuoterV2 against a zero-liquidity pool reverts or returns garbage, so the price-sanity check
+  // below MUST NOT run in that case — it would misread "needs seeding" as "mispriced" and abort
+  // the whole run. Liquidity is checked FIRST, before any quote is attempted, specifically to
+  // route around that.
   const existingPool = (await publicClient.readContract({
     address: FACTORY,
     abi: factoryAbi,
@@ -584,7 +604,17 @@ export async function seedPool(
     args: [USDC, WETH, FEE_TIER],
   })) as Address;
 
-  if (existingPool !== zeroAddress) {
+  const poolAlreadyExists = existingPool !== zeroAddress;
+  let existingPoolLiquidity = 0n;
+  if (poolAlreadyExists) {
+    existingPoolLiquidity = (await publicClient.readContract({
+      address: existingPool,
+      abi: poolStateAbi,
+      functionName: "liquidity",
+    })) as bigint;
+  }
+
+  if (poolAlreadyExists && existingPoolLiquidity > 0n) {
     console.log(`\npool already exists at ${existingPool} — checking price sanity before exiting...`);
     const quotes = await checkQuotesSane(`pool at ${existingPool}`);
     console.log(
@@ -604,7 +634,15 @@ export async function seedPool(
     return result;
   }
 
-  console.log(`\nno pool yet at fee=${FEE_TIER} for this pair — seeding it now.`);
+  if (poolAlreadyExists) {
+    console.log(
+      `\npool already exists at ${existingPool} but has ZERO liquidity (a previous mint likely ` +
+        `reverted or was never completed) — skipping the pre-mint quote check (QuoterV2 cannot ` +
+        `price an empty pool) and proceeding straight to minting into it.`,
+    );
+  } else {
+    console.log(`\nno pool yet at fee=${FEE_TIER} for this pair — seeding it now.`);
+  }
 
   // 1 (deferred). Only require enough ETH once we know we actually have to spend it: the
   // gas-free idempotent-exit path above must never be blocked by an underfunded wallet, since it
@@ -636,11 +674,16 @@ export async function seedPool(
     WETH_SEED_TARGET > wethBalanceBeforeMint ? WETH_SEED_TARGET - wethBalanceBeforeMint : 0n;
   const wethDepositNeeded = wethFaucetMintable ? 0n : wethShortfall;
 
+  // Resuming into an already-created, already-initialized (but empty) pool skips both faucet
+  // mints and the pool-creation call's real work, so it needs far less gas than a fully fresh
+  // run — use the smaller budget in that case so the pre-flight ETH check reflects what this run
+  // will actually spend, not what a from-scratch run would.
+  const estimatedGasUnits = poolAlreadyExists ? ESTIMATED_GAS_UNITS_RESUME : ESTIMATED_GAS_UNITS;
   const gasPrice = await publicClient.getGasPrice();
-  const estimatedGasCost = ESTIMATED_GAS_UNITS * gasPrice;
+  const estimatedGasCost = estimatedGasUnits * gasPrice;
   console.log(
     `estimated gas cost for this run: ~${formatEther(estimatedGasCost)} ETH ` +
-      `(${ESTIMATED_GAS_UNITS.toLocaleString("en-US")} gas units @ ${formatUnits(gasPrice, 9)} gwei)`,
+      `(${estimatedGasUnits.toLocaleString("en-US")} gas units @ ${formatUnits(gasPrice, 9)} gwei)`,
   );
 
   const ethNeeded = wethDepositNeeded + estimatedGasCost;

@@ -1,0 +1,76 @@
+{
+  "chainId": 11155111,
+  "network": "sepolia",
+  "seededAt": "2026-07-15T00:52:01.976Z",
+  "deployer": "0xE53f456f1CB8c50FD65B7FbC4C5b320CB185fad5",
+  "agentRuntime": "0xE53f456f1CB8c50FD65B7FbC4C5b320CB185fad5",
+  "agent": {
+    "registered": true,
+    "agentId": "0",
+    "note": "Registered via the live Nox gateway in an earlier deploy session (not this seed run). Not independently re-verified via registry.metaOf here because of an ABI/tuple-decoding mismatch in the throwaway verification script used for this task, not a contract issue; every other cross-contract wiring check below (executor<->netSettler, adapter ownership, executor.usdc/weth/fee) was read fresh from live Sepolia and passed."
+  },
+  "addresses": {
+    "strategyRegistry": "0x307056cD4800ea5F1E6dA86deA9bAdCe0067bFDc",
+    "occultaUSDC": "0x058a10E2D029Ea92c484329BdADcFF9a8122B188",
+    "occultaVaultFactory": "0x3104242b5A1691649Bb92b6192cd755A5fA0Ba16",
+    "occultaVault": "0xeA1ED96c5c1D089C9203633fF485499C22FEBe9F",
+    "aaveAdapter": "0x98b6e2071D092adf54B654Bb72c30B807D539e0D",
+    "uniswapAdapter": "0xE4E50a8fE8E1E0963b4BA9F8f8B39458972E59cA",
+    "occultaExecutor": "0xBA3A8E6Cba95a7bAAb0BcdB8E6Fb1A4143249831",
+    "netSettler": "0x8BB7CF578cc1953430e64B1d08A68fEA17e14Feb",
+    "aavePool": "0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951",
+    "swapRouter02": "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E",
+    "quoterV2": "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3",
+    "uniswapV3Factory": "0x0227628f3F023bb0B980b67D528571c95c6DaC1c",
+    "nonfungiblePositionManager": "0x1238536071E1c677A632429e3655c799b22cDA52",
+    "aaveFaucet": "0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D",
+    "usdc": "0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8",
+    "weth": "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c"
+  },
+  "wiring": {
+    "note": "Read fresh from live Sepolia during this task, independently of the earlier deploy session that produced the contract addresses above.",
+    "executorSettlerEqualsNetSettler": true,
+    "netSettlerExecutorEqualsExecutor": true,
+    "aaveAdapterOwnerEqualsExecutor": true,
+    "uniswapAdapterOwnerEqualsExecutor": true,
+    "vaultOwnerEqualsAgentRuntime": true,
+    "executorUsdcEqualsLiveAaveUsdc": true,
+    "executorWethEqualsLiveAaveWeth": true,
+    "executorFeeEquals10000": true
+  },
+  "pool": {
+    "address": "0x264B8FB8D89c401cACe37F9501dd072bf35a2E0d",
+    "token0": "0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8",
+    "token1": "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c",
+    "fee": 10000,
+    "tickLower": 195400,
+    "tickUpper": 197400,
+    "sqrtPriceX96": "1446501726624926496477173928747177",
+    "liquidityAfterSeed": "39205547539359"
+  },
+  "quotes": {
+    "oneWethInUsdc": "2957727333",
+    "oneThousandUsdcInWeth": "327925103340269751"
+  },
+  "demoSwapPriceImpact": {
+    "usdcIn": "10000000",
+    "usdcToWethOut": "3284855903551441",
+    "usdcToWethImpactBps": "145",
+    "wethIn": "3333333333333333",
+    "wethToUsdcOut": "9854567",
+    "wethToUsdcImpactBps": "145"
+  },
+  "createdThisRun": true,
+  "poolPreviouslyExistedEmpty": true,
+  "amountsDeposited": {
+    "usdc": "119341971",
+    "weth": "29999999999999613"
+  },
+  "wethSource": "deposit-fallback",
+  "txHashes": {
+    "seedPool.approveUsdc": "0x8bfd7f1586771700ceb3130f61a8d0ebbcdd2d193df2d5073ccdd8b8a63a5c70",
+    "seedPool.approveWeth": "0x0d6ab386595992c683fbe58a8cbe2eb0f8054e302256532f97ddb978f005e8f4",
+    "seedPool.createAndInitializePool": "0x1f1659c6f3c8863a1fde083ef829e98d928c7b5f8bbea31e85d588af70c79e59",
+    "seedPool.mintPosition": "0x47830456717a70e4012c2b32ed2d040d16597d331f931d850fc0bcfd30e7a904"
+  }
+}
