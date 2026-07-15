@@ -41,7 +41,7 @@ export function RevealPanel() {
     stopAnimation();
     setRevealed(true);
 
-    const finalText = `${data.net.formatted} USDC · ${data.net.isBuy ? "BUY" : "SELL"}`;
+    const finalText = `${data.net.formatted} ${data.net.unit} · ${data.net.isBuy ? "BUY" : "SELL"}`;
     delayRef.current = window.setTimeout(() => {
       delayRef.current = null;
       stopRef.current = scrambleInto(finalText, setDisplayText, 780);
@@ -51,7 +51,7 @@ export function RevealPanel() {
   return (
     <div className="reveal-card">
       <div className="reveal-label">
-        {ready ? `Epoch ${data.epoch} · Aggregate net order` : "Latest settled epoch · Aggregate net order"}
+        {ready ? `Epoch ${data.epoch} · Aggregate net order` : "Featured epoch · Aggregate net order"}
       </div>
 
       <div className={`stage${revealed ? " revealed" : ""}`}>

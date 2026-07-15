@@ -6,6 +6,7 @@ export interface RevealSuccess {
   net: {
     raw: string;
     formatted: string;
+    unit: "USDC" | "WETH";
     isBuy: boolean;
   };
   handles: { net: string; direction: string };

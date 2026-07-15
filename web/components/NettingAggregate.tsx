@@ -27,7 +27,7 @@ export function NettingAggregate() {
         const entry = entries[0];
         if (entry?.isIntersecting && !firedRef.current) {
           firedRef.current = true;
-          const finalText = `Net · ${data.net.formatted} USDC · ${data.net.isBuy ? "Buy" : "Sell"}`;
+          const finalText = `Net · ${data.net.formatted} ${data.net.unit} · ${data.net.isBuy ? "Buy" : "Sell"}`;
           stopRef.current = scrambleInto(finalText, setScrambled, 780);
           observer.disconnect();
         }

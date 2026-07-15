@@ -1,6 +1,7 @@
 import { loadDeployment } from "@/lib/deployment";
 import { sepoliaPublicClient } from "@/lib/chain";
 import { strategyRegistryAbi, netSettlerAbi, aaveAdapterAbi } from "@/lib/abi";
+import { FEATURED_EPOCH } from "@/lib/reveal";
 import { SiteHeader } from "@/components/SiteHeader";
 import { Hero } from "@/components/Hero";
 import { RevealProvider } from "@/components/RevealContext";
@@ -44,29 +45,23 @@ async function readAaveAccountData(): Promise<AaveAccountData | null> {
   }
 }
 
-async function readLatestSettledEpoch(): Promise<{ epoch: string; intentCount: string } | null> {
+// Reads the same featured epoch the reveal card decrypts (see `lib/reveal.ts`), so the netting
+// section's "epoch N · M intents folded" caption always describes the epoch the diagram above it
+// and the reveal card below it are both talking about, rather than whatever settled most
+// recently.
+async function readFeaturedEpoch(): Promise<{ epoch: string; intentCount: string } | null> {
   try {
     const deployment = loadDeployment();
     const publicClient = sepoliaPublicClient();
-    const currentEpoch = await publicClient.readContract({
+    const epoch = FEATURED_EPOCH;
+    const [intentCount, closed, settled] = await publicClient.readContract({
       address: deployment.addresses.netSettler,
       abi: netSettlerAbi,
-      functionName: "currentEpoch",
-      args: [deployment.agentId],
+      functionName: "epochStateOf",
+      args: [deployment.agentId, epoch],
     });
-    for (let epoch = currentEpoch - 1n; epoch >= 0n; epoch--) {
-      const [intentCount, closed, settled] = await publicClient.readContract({
-        address: deployment.addresses.netSettler,
-        abi: netSettlerAbi,
-        functionName: "epochStateOf",
-        args: [deployment.agentId, epoch],
-      });
-      if (closed && settled) {
-        return { epoch: epoch.toString(), intentCount: intentCount.toString() };
-      }
-      if (epoch === 0n) break;
-    }
-    return null;
+    if (!closed || !settled) return null;
+    return { epoch: epoch.toString(), intentCount: intentCount.toString() };
   } catch {
     return null;
   }
@@ -74,10 +69,10 @@ async function readLatestSettledEpoch(): Promise<{ epoch: string; intentCount: s
 
 export default async function Home() {
   const deployment = loadDeployment();
-  const [meta, aave, latestEpoch] = await Promise.all([
+  const [meta, aave, featuredEpoch] = await Promise.all([
     readAgentMeta(),
     readAaveAccountData(),
-    readLatestSettledEpoch(),
+    readFeaturedEpoch(),
   ]);
 
   return (
@@ -107,8 +102,8 @@ export default async function Home() {
           />
 
           <NettingSection
-            epoch={latestEpoch?.epoch ?? null}
-            intentCount={latestEpoch?.intentCount ?? null}
+            epoch={featuredEpoch?.epoch ?? null}
+            intentCount={featuredEpoch?.intentCount ?? null}
           />
         </RevealProvider>
 

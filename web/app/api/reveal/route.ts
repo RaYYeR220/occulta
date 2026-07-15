@@ -6,7 +6,8 @@ import { createViemHandleClient } from "@iexec-nox/handle";
 import { loadDeployment } from "@/lib/deployment";
 import { netSettlerAbi } from "@/lib/abi";
 import { sepoliaPublicClient, sepoliaRpcUrl } from "@/lib/chain";
-import { formatUsdcUnits } from "@/lib/format";
+import { formatNetAmount } from "@/lib/format";
+import { FEATURED_EPOCH } from "@/lib/reveal";
 
 export const dynamic = "force-dynamic";
 
@@ -21,45 +22,38 @@ export const dynamic = "force-dynamic";
  * PUBLICLY decryptable on-chain by `NetSettler.closeEpoch` (see contracts/settle/NetSettler.sol),
  * so `createViemHandleClient` only ever needs a plain read-only viem `WalletClient` pointed at a
  * public RPC — no `account`, no signature, nothing secret.
+ *
+ * Always decrypts {@link FEATURED_EPOCH} — the documented demo epoch the rest of this page is
+ * built around — rather than whichever epoch settled most recently. `NetSettler` settles epochs
+ * autonomously, and a later epoch is a real on-chain epoch too, but it can net a different asset
+ * entirely (see `lib/reveal.ts`). This is still a genuine live `publicDecrypt`, just of a chosen
+ * epoch number instead of an auto-discovered one.
  */
 export async function GET() {
   try {
     const deployment = loadDeployment();
     const publicClient = sepoliaPublicClient();
+    const epoch = FEATURED_EPOCH;
 
-    const currentEpoch = await publicClient.readContract({
+    const [intentCount, closed, settled] = await publicClient.readContract({
       address: deployment.addresses.netSettler,
       abi: netSettlerAbi,
-      functionName: "currentEpoch",
-      args: [deployment.agentId],
+      functionName: "epochStateOf",
+      args: [deployment.agentId, epoch],
     });
 
-    if (currentEpoch === 0n) {
+    if (!closed || !settled) {
       return NextResponse.json(
-        { ok: false, reason: "no-epoch-settled", message: "No epoch has closed for this agent yet." },
+        {
+          ok: false,
+          reason: "no-epoch-settled",
+          message: `Featured epoch ${epoch.toString()} has not closed and settled yet.`,
+        },
         { status: 200 },
       );
     }
 
-    // The open epoch is `currentEpoch`; the most recently closed one is the epoch right before
-    // it. Walk backwards from there for the newest epoch that is both closed and settled.
-    for (let epoch = currentEpoch - 1n; epoch >= 0n; epoch--) {
-      const [intentCount, closed, settled] = await publicClient.readContract({
-        address: deployment.addresses.netSettler,
-        abi: netSettlerAbi,
-        functionName: "epochStateOf",
-        args: [deployment.agentId, epoch],
-      });
-      if (closed && settled) {
-        return await revealEpoch(deployment, publicClient, epoch, intentCount);
-      }
-      if (epoch === 0n) break;
-    }
-
-    return NextResponse.json(
-      { ok: false, reason: "no-epoch-settled", message: "No settled epoch found for this agent." },
-      { status: 200 },
-    );
+    return await revealEpoch(deployment, publicClient, epoch, intentCount);
   } catch (error) {
     return NextResponse.json(
       {
@@ -131,6 +125,7 @@ async function revealEpoch(
 
   const netRaw = netResult.value as bigint;
   const isBuy = directionResult.value as boolean;
+  const { formatted, unit } = formatNetAmount(netRaw, isBuy);
 
   return NextResponse.json({
     ok: true,
@@ -139,7 +134,8 @@ async function revealEpoch(
     intentCount: intentCount.toString(),
     net: {
       raw: netRaw.toString(),
-      formatted: formatUsdcUnits(netRaw),
+      formatted,
+      unit,
       isBuy,
     },
     handles: { net: netHandle, direction: directionHandle },
