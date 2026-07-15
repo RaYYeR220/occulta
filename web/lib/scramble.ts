@@ -9,18 +9,25 @@ export function prefersReducedMotion(): boolean {
 /**
  * Hex-noise decrypt effect: scrambles through random hex glyphs, resolving left-to-right into
  * the real, already-fetched plaintext. Ported from the noir-dossier reveal interaction and
- * restyled for the obsidian palette — ported as a technique (progressive per-character resolve
- * driven by `requestAnimationFrame`), not copy-pasted, since it now runs against a React ref
- * instead of a raw DOM query.
+ * restyled for the obsidian palette.
+ *
+ * Deliberately DOM-free: it never touches an element directly (no `textContent` writes). Each
+ * frame is handed to `onFrame` instead, so the caller can push it through React state and let
+ * React own the text node exclusively. Driving this by direct DOM mutation on a React-rendered
+ * node caused the two renderers to fight over the same child (React re-diffing text nodes the
+ * animation had already replaced underneath it), which surfaced as intermittent
+ * `removeChild: node is not a child of this node` errors on repeated reveal/conceal. Returning a
+ * cancel function — and having the caller invoke it before starting a new run and on unmount —
+ * keeps repeated toggles idempotent.
  */
 export function scrambleInto(
-  el: HTMLElement,
   finalText: string,
+  onFrame: (text: string) => void,
   duration = 750,
   onDone?: () => void,
 ): () => void {
   if (prefersReducedMotion()) {
-    el.textContent = finalText;
+    onFrame(finalText);
     onDone?.();
     return () => {};
   }
@@ -43,11 +50,12 @@ export function scrambleInto(
       const revealAt = (i + 1) / finalText.length;
       out += progress > revealAt ? ch : SCRAMBLE_CHARS[Math.floor(Math.random() * SCRAMBLE_CHARS.length)];
     }
-    el.textContent = out;
+    if (cancelled) return;
+    onFrame(out);
     if (progress < 1) {
       frame = requestAnimationFrame(step);
     } else {
-      el.textContent = finalText;
+      onFrame(finalText);
       onDone?.();
     }
   }

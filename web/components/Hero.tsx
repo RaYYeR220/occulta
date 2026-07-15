@@ -3,7 +3,6 @@ export function Hero() {
     <section className="hero" id="top">
       <div className="eclipse" aria-hidden>
         <div className="corona" />
-        <div className="ring" />
         <div className="disc" />
       </div>
       <div className="wrap hero-inner">
@@ -17,10 +16,6 @@ export function Hero() {
           epoch even closes. Occulta seals the strategy and every position, reveals only the
           aggregate net per epoch, and executes for real on Aave V3 and Uniswap V3.
         </p>
-        <div className="scroll-cue">
-          <span>totality ends below</span>
-          <span className="stem" aria-hidden />
-        </div>
       </div>
     </section>
   );

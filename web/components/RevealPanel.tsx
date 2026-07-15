@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useReveal } from "@/components/RevealContext";
 import { scrambleInto } from "@/lib/scramble";
 import { etherscanTx, SAMPLE_INTENT_TX_HASH } from "@/lib/links";
@@ -8,31 +8,43 @@ import { etherscanTx, SAMPLE_INTENT_TX_HASH } from "@/lib/links";
 export function RevealPanel() {
   const { status, data, errorMessage, request } = useReveal();
   const [revealed, setRevealed] = useState(false);
-  const [sweeping, setSweeping] = useState(false);
-  const valueRef = useRef<HTMLDivElement | null>(null);
+  const [displayText, setDisplayText] = useState("");
   const stopRef = useRef<() => void>(() => {});
+  const delayRef = useRef<number | null>(null);
 
   const ready = status === "ready" && data?.ok;
 
+  // Cancel any in-flight scramble frame loop and the pre-scramble delay, so a re-entrant toggle
+  // never races a stale animation against the one just started (or against unmount).
+  function stopAnimation() {
+    if (delayRef.current !== null) {
+      window.clearTimeout(delayRef.current);
+      delayRef.current = null;
+    }
+    stopRef.current();
+    stopRef.current = () => {};
+  }
+
+  useEffect(() => stopAnimation, []);
+
   function handleReveal() {
     if (revealed) {
+      stopAnimation();
       setRevealed(false);
+      setDisplayText("");
       return;
     }
     if (!ready) {
       request();
       return;
     }
+    stopAnimation();
     setRevealed(true);
-    setSweeping(true);
-    window.setTimeout(() => setSweeping(false), 720);
 
     const finalText = `${data.net.formatted} USDC · ${data.net.isBuy ? "BUY" : "SELL"}`;
-    window.setTimeout(() => {
-      if (valueRef.current) {
-        stopRef.current();
-        stopRef.current = scrambleInto(valueRef.current, finalText, 780);
-      }
+    delayRef.current = window.setTimeout(() => {
+      delayRef.current = null;
+      stopRef.current = scrambleInto(finalText, setDisplayText, 780);
     }, 140);
   }
 
@@ -45,8 +57,8 @@ export function RevealPanel() {
       <div className={`stage${revealed ? " revealed" : ""}`}>
         <div className="glow" />
         {revealed ? (
-          <div className="reveal-value" ref={valueRef} aria-live="polite">
-            {ready ? `${data.net.formatted} USDC · ${data.net.isBuy ? "BUY" : "SELL"}` : ""}
+          <div className="reveal-value" aria-live="polite">
+            {displayText}
           </div>
         ) : (
           <div className="reveal-veil">
@@ -60,7 +72,6 @@ export function RevealPanel() {
             </span>
           </div>
         )}
-        {sweeping && <div className="scan-flash sweep" aria-hidden />}
       </div>
 
       <button

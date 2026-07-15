@@ -303,25 +303,17 @@ nav.nav-inner {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, rgba(233, 220, 255, 0.5) 0%, rgba(139, 92, 246, 0.32) 22%, rgba(91, 52, 173, 0.16) 40%, transparent 66%);
-  filter: blur(6px);
+  background: radial-gradient(circle at 50% 50%, rgba(233, 220, 255, 0.46) 0%, rgba(139, 92, 246, 0.3) 26%, rgba(91, 52, 173, 0.14) 46%, transparent 70%);
+  filter: blur(34px);
   animation: breathe 9s ease-in-out infinite;
-}
-.eclipse .ring {
-  position: absolute;
-  inset: 150px;
-  border-radius: 50%;
-  background: conic-gradient(from 0deg, transparent, rgba(183, 155, 251, 0.5), transparent 30%, transparent 70%, rgba(233, 220, 255, 0.4), transparent);
-  filter: blur(3px);
-  animation: spin 34s linear infinite;
-  opacity: 0.7;
 }
 .eclipse .disc {
   position: absolute;
   inset: 172px;
   border-radius: 50%;
   background: radial-gradient(circle at 38% 32%, #14101f, var(--void) 70%);
-  box-shadow: 0 0 90px 30px rgba(0, 0, 0, 0.85), inset -14px -10px 34px rgba(139, 92, 246, 0.12);
+  box-shadow: 0 0 120px 60px rgba(0, 0, 0, 0.7);
+  filter: blur(10px);
 }
 @keyframes breathe {
   0%,
@@ -334,14 +326,8 @@ nav.nav-inner {
     transform: scale(1.045);
   }
 }
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
 @media (prefers-reduced-motion: reduce) {
-  .eclipse .corona,
-  .eclipse .ring {
+  .eclipse .corona {
     animation: none;
   }
 }
@@ -384,40 +370,6 @@ nav.nav-inner {
   font-size: 16px;
   line-height: 1.75;
 }
-.scroll-cue {
-  margin-top: 60px;
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  color: var(--ink-faint);
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-}
-.scroll-cue .stem {
-  width: 1px;
-  height: 36px;
-  background: linear-gradient(180deg, var(--violet), transparent);
-  animation: stemPulse 2.4s ease-in-out infinite;
-}
-@keyframes stemPulse {
-  0%,
-  100% {
-    opacity: 0.3;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .scroll-cue .stem {
-    animation: none;
-    opacity: 0.6;
-  }
-}
-
 /* ---------- reveal ---------- */
 
 .reveal-section {
@@ -563,33 +515,6 @@ nav.nav-inner {
   font-size: 12.5px;
   color: var(--amber-bright);
   line-height: 1.6;
-}
-
-.scan-flash {
-  position: absolute;
-  inset: -6px;
-  z-index: 5;
-  pointer-events: none;
-  background: linear-gradient(90deg, transparent, rgba(233, 220, 255, 0.55) 45%, transparent 90%);
-  opacity: 0;
-  mix-blend-mode: screen;
-  border-radius: 16px;
-}
-.scan-flash.sweep {
-  animation: sweep 0.7s ease-out forwards;
-}
-@keyframes sweep {
-  0% {
-    opacity: 0;
-    transform: translateX(-100%);
-  }
-  15% {
-    opacity: 0.9;
-  }
-  100% {
-    opacity: 0;
-    transform: translateX(100%);
-  }
 }
 
 .privacy-note {
@@ -795,12 +720,14 @@ nav.nav-inner {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 14px 20px;
+  height: 58px;
+  padding: 0 20px;
   border-radius: 14px;
   background: var(--shadow-mass);
   border: 1px solid rgba(255, 255, 255, 0.05);
-  width: 288px;
+  width: 320px;
   box-shadow: 0 20px 40px -20px rgba(0, 0, 0, 0.8);
+  overflow: hidden;
 }
 .intent .side {
   font-family: var(--mono);
@@ -819,12 +746,24 @@ nav.nav-inner {
   background: rgba(255, 255, 255, 0.05);
   color: var(--ink-dim);
 }
-.intent .blur {
+.intent .seal {
+  flex-shrink: 0;
+  width: 54px;
+  height: 14px;
+  border-radius: 4px;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(139, 92, 246, 0.32) 0 3px,
+    rgba(139, 92, 246, 0.1) 3px 6px
+  );
+  border: 1px solid rgba(139, 92, 246, 0.22);
+}
+.intent .amount {
   font-family: var(--mono);
-  font-size: 12.5px;
-  color: rgba(167, 159, 196, 0.4);
-  letter-spacing: 0.05em;
-  filter: blur(0.6px);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  color: var(--ink-dim);
+  flex-shrink: 0;
 }
 .intent .tx-link {
   margin-left: auto;
@@ -1103,9 +1042,6 @@ footer .stack {
   }
   .eclipse .disc {
     inset: 110px;
-  }
-  .eclipse .ring {
-    inset: 95px;
   }
   .reveal-card {
     padding: 40px 22px 30px;

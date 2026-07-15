@@ -26,15 +26,18 @@ export function NettingSection({
           <div className="intents">
             <div className="intent buy">
               <span className="side">BUY</span>
-              <span className="blur">████ 20.00 ████</span>
+              <span className="seal" aria-hidden />
+              <span className="amount">20.00</span>
             </div>
             <div className="intent buy">
               <span className="side">BUY</span>
-              <span className="blur">████ 15.00 ████</span>
+              <span className="seal" aria-hidden />
+              <span className="amount">15.00</span>
             </div>
             <div className="intent sell">
               <span className="side">SELL</span>
-              <span className="blur">████ 5.00 ████</span>
+              <span className="seal" aria-hidden />
+              <span className="amount">5.00</span>
               <a
                 className="tx-link"
                 href={etherscanTx(SAMPLE_INTENT_TX_HASH)}
