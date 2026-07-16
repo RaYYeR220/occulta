@@ -9,6 +9,8 @@ then executes for real, on unmodified Aave V3 and Uniswap V3.
 Nobody sees your balance. Nobody sees your intent. Nobody sees the strategy. The chain only ever
 learns one number per epoch: the net order.
 
+**▶ [Watch the 3-minute demo](https://youtu.be/ixvvq1Om5uw)** · **[Live app](https://occulta-nox.vercel.app)** · [Verified contracts on Sepolia ↓](#live-on-sepolia)
+
 ## The problem
 
 A public on-chain strategy is a strategy that stops working the moment it's good. Publish your
