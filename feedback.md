@@ -52,8 +52,12 @@ overstated for every settlement that happens in the same batch, before anyone cl
 each (`totalSupply = 2e12`), settling a full redeem for both in the same batch — the normal
 operating pattern, not an attack — reserves the first `1e6` correctly, but then reserves the
 **second redeemer 1,999,999** for shares actually worth `1,000,000`: the vault becomes insolvent
-by roughly 50%, and whoever claims second gets silently clamped to nothing on the underfunded
-transfer. Symmetrically, a depositor who enters *after* an approved-but-unclaimed redeem is priced
+by roughly 50%. The accounting corruption is *unconditional* — it happens at `approveRedeem` time,
+which moves no tokens, so nothing masks it. (In the *unmodified* reference, `redeem()`'s claim step
+then reverts on its own via the `confidentialTransfer` ACL issue in §3 below, so the "second claimant
+silently clamped to nothing" failure only surfaces once that transfer path is fixed — as it is in our
+fork; the inflated-NAV corruption itself needs no such fix to be real.) Symmetrically, a depositor
+who enters *after* an approved-but-unclaimed redeem is priced
 against the reserved assets too and gets diluted — minting roughly half the fair share count for
 the same input. Both reproduce with exact, predictable numbers; neither needs an adversary, only
 the ordinary settle-a-batch-then-claim-later flow every async vault uses.
@@ -104,8 +108,10 @@ a secret, and Nox knows it isn't. Two consequences that surprised us:
   seeding a zero or a constant inside contract logic — which is fine, it's the correct tool there —
   but it's an easy mistake to reach for the same function when you actually meant to seal a value,
   and the failure mode is "the value was never confidential in the first place," not a helpful
-  revert at the point of the mistake. Worth a prominent doc callout right next to the function
-  signature.
+  revert at the point of the mistake. The docs already carry a good "this value is public, by design"
+  warning on the `wrapAsPublicHandle` page — what would round it out is a one-line cross-reference to
+  the concrete `PublicHandleACLForbidden()` revert you hit if you later try to `allowPublicDecryption`
+  such a handle, so the two behaviors are connected in one place.
 
 ### 3. `confidentialTransfer` vs `confidentialTransferFrom` ACL asymmetry
 
